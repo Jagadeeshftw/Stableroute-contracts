@@ -1054,8 +1054,7 @@ impl StableRouteRouter {
         Self::require_admin(&env);
         let removed: Option<i128> = env.storage().persistent().get(&DataKey::MaxFeeAbsolute);
         env.storage().persistent().remove(&DataKey::MaxFeeAbsolute);
-        env.events()
-            .publish((symbol_short!("mxfee_clr"),), removed);
+        env.events().publish((symbol_short!("mxfee_clr"),), removed);
     }
 
     /// Clamp `fee` to the configured absolute floor when one is set.
