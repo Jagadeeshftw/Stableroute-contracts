@@ -55,7 +55,7 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | `set_pair_fee_bps` | admin | `source: Symbol, destination: Symbol, fee_bps: u32` | — | `ContractPaused` (#9), `NotInitialized` (#2), `FeeBpsTooHigh` (#4) | `fee_set(source, destination, fee_bps)` |
 | `set_pair_fees_bps` | admin | `entries: Vec<(Symbol, Symbol, u32)>` | — | `ContractPaused` (#9), `NotInitialized` (#2), `EmptyBatch` (#19), `BatchTooLarge` (#18), `FeeBpsTooHigh` (#4), `PairNotRegistered` (#5) | `fee_set(source, destination, fee_bps)` per entry |
 | `get_pair_fee_bps` | none | `source: Symbol, destination: Symbol` | `u32` | — | — |
-| `set_fee_recipient` | admin | `recipient: Address` | — | `NotInitialized` (#2) | — |
+| `set_fee_recipient` | admin | `recipient: Address` | — | `NotInitialized` (#2) | `recip_set(recipient)` |
 | `get_fee_recipient` | none | — | `Option<Address>` | — | — |
 | `set_max_fee_absolute` | admin | `max_fee: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6), `ZeroFeeCap` (#21) | `maxfee(max_fee)` |
 | `get_max_fee_absolute` | none | — | `Option<i128>` | — | — |
@@ -65,9 +65,9 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 
 | Entrypoint | Auth | Params | Returns | Errors | Event |
 |-----------|------|--------|---------|--------|-------|
-| `set_pair_min_amount` | admin | `source, destination: Symbol, min_amount: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | — |
+| `set_pair_min_amount` | admin | `source, destination: Symbol, min_amount: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `min_set(source, destination, min_amount)` |
 | `get_pair_min_amount` | none | `source, destination: Symbol` | `i128` | — | — |
-| `set_pair_max_amount` | admin | `source, destination: Symbol, max_amount: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | — |
+| `set_pair_max_amount` | admin | `source, destination: Symbol, max_amount: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `max_set(source, destination, max_amount)` |
 | `get_pair_max_amount` | none | `source, destination: Symbol` | `i128` | — | — |
 | `set_pair_liquidity` | admin | `source, destination: Symbol, liquidity: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `liq_set(source, destination, liquidity)` |
 | `get_pair_liquidity` | none | `source, destination: Symbol` | `i128` | — | — |
@@ -97,8 +97,9 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `unreg` | `(source, destination): (Symbol, Symbol)` | `unregister_pair` |
 | `cfg_clr` | `(source, destination): (Symbol, Symbol)` | `unregister_pair` |
 | `fee_set` | `(source, destination, fee_bps): (Symbol, Symbol, u32)` | `set_pair_fee_bps` |
-| `maxfee` | `max_fee: i128` | `set_max_fee_absolute` |
-| `mxfee_clr` | `cleared_cap: Option<i128>` | `clear_max_fee_absolute` |
+| `min_set` | `(source, destination, min_amount): (Symbol, Symbol, i128)` | `set_pair_min_amount` |
+| `max_set` | `(source, destination, max_amount): (Symbol, Symbol, i128)` | `set_pair_max_amount` |
+| `recip_set` | `recipient: Address` | `set_fee_recipient` |
 | `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |
 
