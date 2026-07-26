@@ -323,17 +323,22 @@ pub struct StableRouteRouter;
 
 #[contractimpl]
 impl StableRouteRouter {
+    /// Read the admin address from instance storage, panicking with
+    /// [`RouterError::NotInitialized`] if absent.
+    fn load_admin(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, RouterError::NotInitialized))
+    }
+
     /// Load the admin address, require its auth, and return it.
     ///
     /// Every admin-gated entrypoint calls this instead of repeating the
     /// six-line load-unwrap-require_auth block. Keeping it private
     /// ensures it never appears in the generated client ABI.
     fn require_admin(env: &Env) -> Address {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, RouterError::NotInitialized));
+        let admin = Self::load_admin(env);
         admin.require_auth();
         admin
     }
@@ -1142,11 +1147,7 @@ impl StableRouteRouter {
         liquidity: i128,
     ) {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NotInitialized));
+        let admin: Address = Self::load_admin(&env);
         let oracle: Option<Address> = env.storage().persistent().get(&DataKey::Oracle);
         if caller != admin && Some(caller.clone()) != oracle {
             panic_with_error!(&env, RouterError::NotAuthorized);
