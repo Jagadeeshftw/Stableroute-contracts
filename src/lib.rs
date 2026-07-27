@@ -360,12 +360,7 @@ impl StableRouteRouter {
     /// that `compute_route_fee` and `quote_route` already raise, keeping
     /// one error code for "this pair does not exist" across the contract.
     fn require_pair_registered(env: &Env, source: &Symbol, destination: &Symbol) {
-        if !env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
-            .unwrap_or(false)
-        {
+        if !Self::read_pair_registered(env, source, destination) {
             panic_with_error!(env, RouterError::PairNotRegistered);
         }
     }
@@ -435,6 +430,19 @@ impl StableRouteRouter {
         Self::bump_instance_ttl(env);
         env.events()
             .publish((symbol_short!("executed"),), new_admin);
+    }
+
+    /// Read whether `(source, destination)` is a registered pair from
+    /// persistent storage.
+    ///
+    /// Returns `false` when the slot is absent — the documented default for an
+    /// unregistered pair. This is the single source of truth for the
+    /// [`DataKey::Pair`] sentinel value.
+    fn read_pair_registered(env: &Env, source: &Symbol, destination: &Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Pair(source.clone(), destination.clone()))
+            .unwrap_or(false)
     }
 
     /// Read the per-pair fee in basis points from persistent storage.
@@ -801,11 +809,7 @@ impl StableRouteRouter {
     /// Returns true iff the pair is registered AND has non-zero
     /// reported liquidity. Useful as a quick is-routable check.
     pub fn is_pair_active(env: Env, source: Symbol, destination: Symbol) -> bool {
-        let s = env.storage().persistent();
-        if !s
-            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
-            .unwrap_or(false)
-        {
+        if !Self::read_pair_registered(&env, &source, &destination) {
             return false;
         }
         Self::read_pair_liquidity(&env, &source, &destination) > 0
@@ -816,9 +820,7 @@ impl StableRouteRouter {
     pub fn get_pair_info(env: Env, source: Symbol, destination: Symbol) -> PairInfo {
         let s = env.storage().persistent();
         PairInfo {
-            registered: s
-                .get(&DataKey::Pair(source.clone(), destination.clone()))
-                .unwrap_or(false),
+            registered: Self::read_pair_registered(&env, &source, &destination),
             fee_bps: Self::read_pair_fee_bps(&env, &source, &destination),
             min_amount: Self::read_pair_min(&env, &source, &destination),
             max_amount: Self::read_pair_max(&env, &source, &destination),
@@ -839,9 +841,7 @@ impl StableRouteRouter {
     pub fn get_pair_info_ext(env: Env, source: Symbol, destination: Symbol) -> PairInfoExt {
         let s = env.storage().persistent();
         PairInfoExt {
-            registered: s
-                .get(&DataKey::Pair(source.clone(), destination.clone()))
-                .unwrap_or(false),
+            registered: Self::read_pair_registered(&env, &source, &destination),
             fee_bps: Self::read_pair_fee_bps(&env, &source, &destination),
             min_amount: Self::read_pair_min(&env, &source, &destination),
             max_amount: Self::read_pair_max(&env, &source, &destination),
@@ -881,14 +881,7 @@ impl StableRouteRouter {
         if amount <= 0 {
             panic_with_error!(&env, RouterError::AmountMustBePositive);
         }
-        if !env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, RouterError::PairNotRegistered);
-        }
+        Self::require_pair_registered(&env, &source, &destination);
         if matches!(
             env.storage()
                 .persistent()
@@ -1280,10 +1273,7 @@ impl StableRouteRouter {
     ///
     /// Registration is independent of liquidity or routing activity.
     pub fn is_pair_registered(env: Env, source: Symbol, destination: Symbol) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Pair(source, destination))
-            .unwrap_or(false)
+        Self::read_pair_registered(&env, &source, &destination)
     }
 
     /// Configure the routing fee for a single registered pair.
@@ -1388,12 +1378,7 @@ impl StableRouteRouter {
             Self::route_abort(&env, RouterError::AmountMustBePositive);
         }
 
-        if !env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::Pair(source.clone(), destination.clone()))
-            .unwrap_or(false)
-        {
+        if !Self::read_pair_registered(&env, &source, &destination) {
             Self::route_abort(&env, RouterError::PairNotRegistered);
         }
         let min_amount = Self::read_pair_min(&env, &source, &destination);
