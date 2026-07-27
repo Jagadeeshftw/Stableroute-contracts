@@ -27,6 +27,9 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | `accept_admin_transfer` | pending | `caller: Address` | — | `NoPendingAdminTransfer` (#7), `NotPendingAdmin` (#8) | `adm_set(caller)` |
 | `cancel_admin_transfer` | admin | — | — | `NotInitialized` (#2) | — |
 | `get_pending_admin` | none | — | `Option<Address>` | — | — |
+| `get_timelock` | none | — | `u64` | — | — |
+| `set_timelock` | admin | `delay_seconds: u64` | — | `NotInitialized` (#2) | `tlock_set(old_delay, new_delay)` |
+| `get_pending_admin_eta` | none | — | `Option<u64>` | — | — |
 
 ## Pause (emergency stop)
 
@@ -70,6 +73,7 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | `set_pair_max_amount` | admin | `source, destination: Symbol, max_amount: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `max_set(source, destination, max_amount)` |
 | `get_pair_max_amount` | none | `source, destination: Symbol` | `i128` | — | — |
 | `set_pair_liquidity` | admin | `source, destination: Symbol, liquidity: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `liq_set(source, destination, liquidity)` |
+| `top_up_pair_liquidity` | oracle/admin | `source, destination: Symbol, delta: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `liq_set(source, destination, liquidity)` |
 | `get_pair_liquidity` | none | `source, destination: Symbol` | `i128` | — | — |
 
 ## Routing
@@ -100,7 +104,7 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `min_set` | `(source, destination, min_amount): (Symbol, Symbol, i128)` | `set_pair_min_amount` |
 | `max_set` | `(source, destination, max_amount): (Symbol, Symbol, i128)` | `set_pair_max_amount` |
 | `recip_set` | `recipient: Address` | `set_fee_recipient` |
-| `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity` |
+| `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity`, `top_up_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |
 
 ## Extended pair info (`PairInfoExt`)

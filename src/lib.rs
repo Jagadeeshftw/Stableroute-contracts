@@ -630,11 +630,22 @@ impl StableRouteRouter {
     /// Admin sets the governance timelock delay (seconds). Applies to the
     /// **next** `propose_admin_transfer`; already-queued actions keep the
     /// eta they were stamped with. Pass 0 to disable (instant handover).
+    ///
+    /// Emits a `tlock_set` event containing the previous and new timelock delay values.
+    ///
+    /// ### Events
+    /// - Topic: `(symbol_short!("tlock_set"),)`
+    /// - Payload: `(old_delay: u64, new_delay: u64)`
     pub fn set_timelock(env: Env, delay_seconds: u64) {
         Self::require_admin(&env);
+        let old_delay = Self::get_timelock(env.clone());
         env.storage()
             .persistent()
             .set(&DataKey::Timelock, &delay_seconds);
+        env.events().publish(
+            (symbol_short!("tlock_set"),),
+            (old_delay, delay_seconds),
+        );
     }
 
     /// Read the earliest timestamp at which the pending admin transfer may
@@ -1156,6 +1167,71 @@ impl StableRouteRouter {
         env.events().publish(
             (symbol_short!("liq_set"),),
             (source, destination, liquidity),
+        );
+    }
+
+    /// Increment the available liquidity for a registered pair.
+    ///
+    /// # Purpose
+    /// Increment the `PairLiquidity` for a registered pair by `delta` using `saturating_add`
+    /// rather than overwriting it, avoiding race conditions where an oracle might
+    /// overwrite concurrent route debits.
+    ///
+    /// # Parameters
+    /// - `caller`: The address initiating the top-up. Must be the admin or the configured oracle.
+    /// - `source`: The source asset symbol of the pair.
+    /// - `destination`: The destination asset symbol of the pair.
+    /// - `delta`: The positive amount to add to the existing liquidity.
+    ///
+    /// # Auth requirements
+    /// Gated by the same dual admin-or-oracle authentication pattern as `set_pair_liquidity`.
+    ///
+    /// # Error conditions
+    /// - Panics with `RouterError::AmountMustBePositive` if `delta` is non-positive (`delta <= 0`).
+    /// - Panics with `RouterError::NotAuthorized` if the caller is neither the admin nor the oracle.
+    /// - Panics with `RouterError::PairNotRegistered` if the pair is not registered.
+    ///
+    /// # Sentinel behavior
+    /// The `i128::MAX` value functions as an unbounded sentinel representing unlimited liquidity.
+    /// If the current liquidity is `i128::MAX`, the value remains at `i128::MAX` and is not reduced.
+    pub fn top_up_pair_liquidity(
+        env: Env,
+        caller: Address,
+        source: Symbol,
+        destination: Symbol,
+        delta: i128,
+    ) {
+        caller.require_auth();
+        let admin: Address = Self::load_admin(&env);
+        let oracle: Option<Address> = env.storage().persistent().get(&DataKey::Oracle);
+        if caller != admin && Some(caller.clone()) != oracle {
+            panic_with_error!(&env, RouterError::NotAuthorized);
+        }
+        if delta <= 0 {
+            panic_with_error!(&env, RouterError::AmountMustBePositive);
+        }
+        Self::require_pair_registered(&env, &source, &destination);
+
+        let current_liq: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairLiquidity(source.clone(), destination.clone()))
+            .unwrap_or(0);
+
+        let new_liq = if current_liq == i128::MAX {
+            i128::MAX
+        } else {
+            current_liq.saturating_add(delta)
+        };
+
+        env.storage().persistent().set(
+            &DataKey::PairLiquidity(source.clone(), destination.clone()),
+            &new_liq,
+        );
+
+        env.events().publish(
+            (symbol_short!("liq_set"),),
+            (source, destination, new_liq),
         );
     }
 
@@ -3292,6 +3368,61 @@ mod test {
         let env = Env::default();
         let _client = setup_uninitialized(&env);
     }
+
+    #[test]
+    fn test_set_timelock_emits_event_on_change() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+
+        // 1. Zero-to-nonzero transition: old timelock is 0, new value is nonzero, assert event payload reflects this
+        client.set_timelock(&100u64);
+        let payloads = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads.len(), 1);
+        let decoded: (u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("tlock_set event data decodes to (u64, u64)");
+        assert_eq!(decoded, (0, 100));
+
+        // 2. Normal change (nonzero-to-nonzero transition)
+        client.set_timelock(&200u64);
+        let payloads2 = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads2.len(), 1);
+        let decoded2: (u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads2[0])
+            .expect("tlock_set event data decodes to (u64, u64)");
+        assert_eq!(decoded2, (100, 200));
+
+        // 3. Nonzero-to-zero transition: old timelock is nonzero, new value is 0, assert event payload reflects this
+        client.set_timelock(&0u64);
+        let payloads3 = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads3.len(), 1);
+        let decoded3: (u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads3[0])
+            .expect("tlock_set event data decodes to (u64, u64)");
+        assert_eq!(decoded3, (200, 0));
+    }
+
+    #[test]
+    fn test_set_timelock_unauthorized_emits_no_event() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "__constructor",
+                args: (admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        env.register_at(&contract_id, StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &contract_id);
+
+        // We make an unauthorized call (no mock_all_auths called, and not signed by admin).
+        let res = client.try_set_timelock(&100u64);
+        assert!(res.is_err(), "Expected error/panic due to unauthorized call");
+
+        let payloads = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads.len(), 0, "No event should be emitted on failed auth");
+    }
 }
 
 /// Issue #14 — pause/unpause gating across state-changing entrypoints.
@@ -3498,6 +3629,120 @@ mod bounds_liquidity {
         assert_eq!(client.get_pair_liquidity(&s, &d), 0);
         // Unset slot behaves as unbounded.
         assert_eq!(client.compute_route_fee(&s, &d, &1i128), 0);
+    }
+
+    #[test]
+    fn test_top_up_pair_liquidity_success() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+
+        // Initial liquidity should be 0 when get_pair_liquidity is called
+        assert_eq!(client.get_pair_liquidity(&s, &d), 0);
+
+        // Top up by 500
+        client.top_up_pair_liquidity(&admin, &s, &d, &500i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 500);
+
+        // Top up by another 300
+        client.top_up_pair_liquidity(&admin, &s, &d, &300i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 800);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #16)")] // RouterError::NotAuthorized is 16
+    fn test_top_up_pair_liquidity_unauthorized() {
+        let env = Env::default();
+        let (client, _admin, s, d) = setup_pair(&env);
+
+        let unauthorized_caller = Address::generate(&env);
+        client.top_up_pair_liquidity(&unauthorized_caller, &s, &d, &100i128);
+    }
+
+    #[test]
+    fn test_top_up_pair_liquidity_authorized_by_oracle() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+
+        let oracle = Address::generate(&env);
+        client.set_oracle(&oracle);
+
+        // Oracle top up should succeed
+        client.top_up_pair_liquidity(&oracle, &s, &d, &500i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 500);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")] // AmountMustBePositive is 6
+    fn test_top_up_pair_liquidity_rejects_zero() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+        client.top_up_pair_liquidity(&admin, &s, &d, &0i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_top_up_pair_liquidity_rejects_negative() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+        client.top_up_pair_liquidity(&admin, &s, &d, &-100i128);
+    }
+
+    #[test]
+    fn test_top_up_pair_liquidity_sentinel_preservation() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+
+        // Set to i128::MAX
+        client.set_pair_liquidity(&admin, &s, &d, &i128::MAX);
+        assert_eq!(client.get_pair_liquidity(&s, &d), i128::MAX);
+
+        // Top up should keep it at i128::MAX
+        client.top_up_pair_liquidity(&admin, &s, &d, &100i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), i128::MAX);
+    }
+
+    #[test]
+    fn test_top_up_after_debit() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+
+        // Set initial liquidity to 1000
+        client.set_pair_liquidity(&admin, &s, &d, &1000i128);
+
+        // Debit 400 by running a route (compute_route_fee debits liquidity by amount)
+        client.compute_route_fee(&s, &d, &400i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 600);
+
+        // Top up by 200
+        client.top_up_pair_liquidity(&admin, &s, &d, &200i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), 800);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")] // RouterError::PairNotRegistered is 5
+    fn test_top_up_pair_liquidity_unregistered_pair() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(&env, &id);
+        let s = symbol_short!("USDC");
+        let d = symbol_short!("EURC");
+        client.top_up_pair_liquidity(&admin, &s, &d, &100i128);
+    }
+
+    #[test]
+    fn test_top_up_pair_liquidity_overflow_saturation() {
+        let env = Env::default();
+        let (client, admin, s, d) = setup_pair(&env);
+
+        // Set to i128::MAX - 50
+        client.set_pair_liquidity(&admin, &s, &d, &(i128::MAX - 50));
+        assert_eq!(client.get_pair_liquidity(&s, &d), i128::MAX - 50);
+
+        // Top up by 100, which overflows and saturates to i128::MAX
+        client.top_up_pair_liquidity(&admin, &s, &d, &100i128);
+        assert_eq!(client.get_pair_liquidity(&s, &d), i128::MAX);
     }
 }
 
@@ -5430,6 +5675,46 @@ mod test_i230_paused_sweep {
         assert_eq!(
             client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
             77
+        );
+    }
+
+    /// `top_up_pair_liquidity` (admin path) — liquidity oracle writes/top-ups are not
+    /// blocked by pause.
+    #[test]
+    fn test_top_up_pair_liquidity_admin_succeeds_while_paused() {
+        let env = Env::default();
+        let (client, admin, _oracle) = setup(&env);
+        client.pause();
+        client.top_up_pair_liquidity(
+            &admin,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &100_i128,
+        );
+        // Initially liquidity is 1_000_000_000, top-up by 100 makes it 1_000_000_100
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            1_000_000_100
+        );
+    }
+
+    /// `top_up_pair_liquidity` (oracle path) — the oracle caller path is
+    /// equally unblocked while paused.
+    #[test]
+    fn test_top_up_pair_liquidity_oracle_succeeds_while_paused() {
+        let env = Env::default();
+        let (client, _admin, oracle) = setup(&env);
+        client.pause();
+        client.top_up_pair_liquidity(
+            &oracle,
+            &symbol_short!("USDC"),
+            &symbol_short!("EURC"),
+            &200_i128,
+        );
+        // Initially liquidity is 1_000_000_000, top-up by 200 makes it 1_000_000_200
+        assert_eq!(
+            client.get_pair_liquidity(&symbol_short!("USDC"), &symbol_short!("EURC")),
+            1_000_000_200
         );
     }
 
