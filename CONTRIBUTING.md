@@ -105,6 +105,7 @@ a short, abbreviated topic name.
 | `mxfee_clr` | `clear_max_fee_absolute` | `cleared_cap: Option<i128>` |
 | `orac_set` | `set_oracle` | `oracle: Address` |
 | `orac_rm` | `remove_oracle` | `removed: Option<Address>` |
+| `tlock_set` | `set_timelock` | `(old_delay, new_delay): (u64, u64)` |
 | `pair_mrst` | `purge_pair_metrics` | `(source, destination): (Symbol, Symbol)` |
 | `upgraded` | `upgrade` | `new_wasm_hash: BytesN<32>` |
 

@@ -630,11 +630,22 @@ impl StableRouteRouter {
     /// Admin sets the governance timelock delay (seconds). Applies to the
     /// **next** `propose_admin_transfer`; already-queued actions keep the
     /// eta they were stamped with. Pass 0 to disable (instant handover).
+    ///
+    /// Emits a `tlock_set` event containing the old and new delay values.
+    ///
+    /// # Events
+    ///
+    /// - Topic: `(symbol_short!("tlock_set"),)`
+    /// - Payload: `(old_delay, new_delay): (u64, u64)`
+    /// - When: fires when the governance timelock delay is modified by the admin.
     pub fn set_timelock(env: Env, delay_seconds: u64) {
         Self::require_admin(&env);
+        let old_delay = Self::get_timelock(env.clone());
         env.storage()
             .persistent()
             .set(&DataKey::Timelock, &delay_seconds);
+        env.events()
+            .publish((symbol_short!("tlock_set"),), (old_delay, delay_seconds));
     }
 
     /// Read the earliest timestamp at which the pending admin transfer may
@@ -2180,6 +2191,38 @@ mod test {
         let (client, _admin) = setup_initialized(&env);
         assert_eq!(client.get_timelock(), 0);
     }
+
+    #[test]
+    fn test_set_timelock_emits_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+
+        // 1. Zero-to-nonzero transition: old timelock is 0, new value nonzero
+        client.set_timelock(&100);
+        let payloads = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads.len(), 1, "should emit exactly one event");
+        let event_data: (u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("tlock_set event data decodes");
+        assert_eq!(event_data, (0, 100));
+
+        // 2. Normal change: old timelock nonzero, new value nonzero
+        client.set_timelock(&200);
+        let payloads = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads.len(), 1, "should emit a second event");
+        let event_data: (u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("tlock_set event data decodes");
+        assert_eq!(event_data, (100, 200));
+
+        // 3. Nonzero-to-zero transition: old timelock nonzero, new value 0
+        client.set_timelock(&0);
+        let payloads = event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads.len(), 1, "should emit a third event");
+        let event_data: (u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("tlock_set event data decodes");
+        assert_eq!(event_data, (200, 0));
+    }
+
+
 
     /// With a delay set, accepting the handover before the eta is rejected
     /// with TimelockNotElapsed (#14).
@@ -4182,11 +4225,19 @@ mod authorization {
     }
 
     #[test]
-    #[should_panic]
     fn test_set_timelock_requires_admin() {
         let env = Env::default();
         let client = setup_scoped(&env);
-        client.set_timelock(&100u64);
+
+        // Attempting set_timelock by unauthorized caller should panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_timelock(&100u64);
+        }));
+        assert!(result.is_err(), "unauthorized set_timelock must panic");
+
+        // Verify no tlock_set events were emitted
+        let payloads = crate::test::event_payloads(&env, symbol_short!("tlock_set"));
+        assert_eq!(payloads.len(), 0, "no events should be emitted on failed auth");
     }
 
     #[test]

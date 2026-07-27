@@ -27,6 +27,8 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | `accept_admin_transfer` | pending | `caller: Address` | — | `NoPendingAdminTransfer` (#7), `NotPendingAdmin` (#8) | `adm_set(caller)` |
 | `cancel_admin_transfer` | admin | — | — | `NotInitialized` (#2) | — |
 | `get_pending_admin` | none | — | `Option<Address>` | — | — |
+| `set_timelock` | admin | `delay_seconds: u64` | — | `NotInitialized` (#2) | `tlock_set(old_delay, new_delay)` |
+| `get_timelock` | none | — | `u64` | — | — |
 
 ## Pause (emergency stop)
 
@@ -102,6 +104,7 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `recip_set` | `recipient: Address` | `set_fee_recipient` |
 | `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |
+| `tlock_set` | `(old_delay, new_delay): (u64, u64)` | `set_timelock` |
 
 ## Extended pair info (`PairInfoExt`)
 
