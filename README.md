@@ -364,6 +364,18 @@ quote.
 The `route_event_payloads` test helper scans the current host event buffer and
 returns only the decoded payloads of events whose single topic is `route`.
 
+### Key-construction optimisation
+
+Each `DataKey` variant that is both read and written within
+`compute_route_fee` — `PairLiquidity`, `PairLastRouteAt`,
+`PairRouteCount`, and `PairVolume` — is constructed **once** into a
+local variable and then referenced by `&` for every subsequent storage
+operation. This halves the number of `Symbol` clones for those hot
+paths. The fee calculation is hoisted before the effects section so
+that the final use of `source` and `destination` — the `route` event
+emission — *moves* (consumes) them instead of cloning. This is an
+internal optimisation with no change to external behaviour.
+
 ### Pair lifecycle event and idempotency matrix
 
 Pair lifecycle tests assert the exact one-event payload emitted by each
