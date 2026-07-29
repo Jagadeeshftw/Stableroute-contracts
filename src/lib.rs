@@ -549,7 +549,10 @@ impl StableRouteRouter {
     ///
     /// Admin-gated; rejects `source == destination`. Idempotent: a
     /// second call with the same pair simply re-asserts the entry and
-    /// is a no-op from the caller's perspective.
+    /// is a no-op from the caller's perspective, including on events —
+    /// `pair_reg` fires only on the transition from unregistered to
+    /// registered, never on a redundant re-assertion of an already
+    /// registered pair.
     ///
     /// **Registration-first invariant:** `set_pair_fee_bps`,
     /// `set_pair_min_amount`, `set_pair_max_amount`, and
@@ -563,16 +566,21 @@ impl StableRouteRouter {
         if source == destination {
             panic_with_error!(&env, RouterError::SourceEqualsDestination);
         }
+        let already_registered = Self::read_pair_registered(&env, &source, &destination);
         env.storage()
             .persistent()
             .set(&DataKey::Pair(source.clone(), destination.clone()), &true);
-        env.events()
-            .publish((symbol_short!("pair_reg"),), (source, destination));
+        if !already_registered {
+            env.events()
+                .publish((symbol_short!("pair_reg"),), (source, destination));
+        }
     }
 
     /// Register multiple `(source, destination)` pairs in a single
     /// admin-gated call. Each entry is validated identically to
-    /// [`Self::register_pair`] and gets its own `pair_reg` event.
+    /// [`Self::register_pair`] and gets its own `pair_reg` event, with the
+    /// same no-duplicate-emission rule: an entry that is already registered
+    /// re-asserts silently instead of re-firing the event.
     ///
     /// **All-or-nothing:** if any entry fails validation the entire
     /// transaction is rolled back (Soroban transactions are atomic), so
@@ -594,11 +602,14 @@ impl StableRouteRouter {
             if source == destination {
                 panic_with_error!(&env, RouterError::SourceEqualsDestination);
             }
+            let already_registered = Self::read_pair_registered(&env, &source, &destination);
             env.storage()
                 .persistent()
                 .set(&DataKey::Pair(source.clone(), destination.clone()), &true);
-            env.events()
-                .publish((symbol_short!("pair_reg"),), (source, destination));
+            if !already_registered {
+                env.events()
+                    .publish((symbol_short!("pair_reg"),), (source, destination));
+            }
         }
     }
 
@@ -2252,6 +2263,43 @@ mod test {
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("EURC"));
         assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
+    }
+
+    /// A re-registration of an already-registered pair must not re-emit
+    /// `pair_reg`: exactly one `pair_reg` event across two calls on the
+    /// same pair.
+    #[test]
+    fn test_register_pair_does_not_duplicate_event_on_reregistration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.register_pair(&s, &d);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("pair_reg")).len(),
+            1,
+            "re-registering an already-registered pair must not emit a second pair_reg event"
+        );
+    }
+
+    /// Batch-registering a mix of one already-registered and one fresh pair
+    /// emits `pair_reg` only for the genuinely new registration.
+    #[test]
+    fn test_register_pairs_does_not_duplicate_event_on_reregistration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        let mut batch = Vec::new(&env);
+        batch.push_back((s.clone(), d.clone()));
+        batch.push_back((symbol_short!("XLM"), symbol_short!("USDC")));
+        client.register_pairs(&batch);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("pair_reg")).len(),
+            2,
+            "one pair_reg for register_pair plus one for the fresh entry in register_pairs; \
+             the already-registered entry must not re-fire"
+        );
     }
 
     #[test]
