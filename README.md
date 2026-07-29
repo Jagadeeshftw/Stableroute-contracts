@@ -20,6 +20,26 @@ constants below:
 | Max batch size | `MAX_BATCH_SIZE` | `100` entries | `register_pairs`, `set_pair_fees_bps` |
 | Max cooldown | `MAX_COOLDOWN_SECS` | `2_592_000` s (30 days) | `set_pair_cooldown` |
 
+### Batch size boundary behavior
+
+Both `register_pairs` and `set_pair_fees_bps` enforce the following batch
+size rules:
+
+| Batch length | Outcome | Error |
+|-------------|---------|-------|
+| `0` (empty) | **Panics** | `EmptyBatch` (#19) |
+| `1` ..= `100` | **Succeeds** | — |
+| `101`+ | **Panics** | `BatchTooLarge` (#18) |
+
+When a batch panics, Soroban's transaction atomicity guarantees that **no
+state is written** — no pairs are registered and no fees are set for any
+entry in the batch. This holds for both `EmptyBatch` and `BatchTooLarge`
+rejections.
+
+The boundary at exactly `MAX_BATCH_SIZE` (100) is the largest accepted
+batch. Callers should split larger workloads into multiple transactions
+of at most 100 entries each.
+
 The `RouterLimits` field order is a stable part of the on-chain ABI — do not
 reorder or insert fields. See [`docs/abi.md`](docs/abi.md) for the authoritative
 reference.
@@ -140,7 +160,7 @@ in [`src/lib.rs`](src/lib.rs).
 | 3 | `SourceEqualsDestination` | `register_pair` | A route's source and destination must differ. |
 | 4 | `FeeBpsTooHigh` | `set_pair_fee_bps` | Fee exceeds `MAX_FEE_BPS` (1000 bps = 10%). Lower the fee. |
 | 5 | `PairNotRegistered` | `compute_route_fee`, `quote_route` | Register the pair before routing/quoting. |
-| 6 | `AmountMustBePositive` | `compute_route_fee`, `quote_route`, `set_pair_liquidity`, `set_pair_min_amount`, `set_pair_max_amount` | Amount/value must be positive (or non-negative where noted). |
+| 6 | `AmountMustBePositive` | `compute_route_fee`, `quote_route`, `set_pair_liquidity`, `top_up_pair_liquidity`, `set_pair_min_amount`, `set_pair_max_amount` | Amount/value must be positive (or non-negative where noted). |
 | 7 | `NoPendingAdminTransfer` | `accept_admin_transfer`, `force_admin_transfer` | No handover is pending; nothing to accept/force. |
 | 8 | `NotPendingAdmin` | `accept_admin_transfer`, `force_admin_transfer` | Caller is not the proposed pending admin, or `force_admin_transfer` was called with the wrong new_admin. |
 | 9 | `ContractPaused` | state-mutating entrypoints (`register_pair`, `set_pair_fee_bps`, …) | Router is paused; retry after `unpause`. |
@@ -150,7 +170,7 @@ in [`src/lib.rs`](src/lib.rs).
 | 13 | `MigrationVersionMismatch` | `migrate_v1_to_v2` | Schema is not at v1; migration already applied. |
 | 14 | `TimelockNotElapsed` | `accept_admin_transfer` | Governance timelock has not elapsed yet; retry after the queued ETA. |
 | 15 | `ReentrantCall` | `compute_route_fee` | Route accounting was re-entered while locked; retry only after the first call completes. |
-| 16 | `NotAuthorized` | `set_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
+| 16 | `NotAuthorized` | `set_pair_liquidity`, `top_up_pair_liquidity` | Caller is neither the admin nor the configured oracle. |
 | 17 | `RouteCooldownActive` | `compute_route_fee` | Pair cooldown has not elapsed since the previous routed amount. |
 | 18 | `BatchTooLarge` | `register_pairs`, `set_pair_fees_bps` | Batch exceeds `MAX_BATCH_SIZE` (100) entries. Split into smaller batches. |
 | 19 | `EmptyBatch` | `register_pairs`, `set_pair_fees_bps` | Batch must contain at least one entry. |
@@ -169,6 +189,7 @@ its per-pair config setters:
 - `set_pair_min_amount`
 - `set_pair_max_amount`
 - `set_pair_liquidity`
+- `top_up_pair_liquidity`
 
 Each setter checks `DataKey::Pair(source, destination)` after its own
 admin/sign validation and rejects an unregistered (or since-unregistered)
@@ -303,7 +324,7 @@ invariants at fixed, human-readable boundary values named in issue #146.
 | Route accounting | `compute_route_fee` | Rejected — `ContractPaused` (#9) |
 | Pair registration | `register_pair`, `register_pairs` | Rejected — `ContractPaused` (#9) |
 | Fee setters | `set_pair_fee_bps`, `set_pair_fees_bps` | Rejected — `ContractPaused` (#9) |
-| Config setters | `set_pair_min_amount`, `set_pair_max_amount`, `set_pair_liquidity`, `set_pair_cooldown`, `set_fee_recipient`, `set_max_fee_absolute`, `clear_max_fee_absolute`, `set_oracle`, `remove_oracle` | Succeeds — governance/config ops are not blocked |
+| Config setters | `set_pair_min_amount`, `set_pair_max_amount`, `set_pair_liquidity`, `top_up_pair_liquidity`, `set_pair_cooldown`, `set_fee_recipient`, `set_max_fee_absolute`, `clear_max_fee_absolute`, `set_oracle`, `remove_oracle` | Succeeds — governance/config ops are not blocked |
 | Pair lifecycle | `unregister_pair`, `purge_pair_metrics` | Succeeds — admin cleanup must remain available |
 | Migration | `migrate_v1_to_v2` | Succeeds — schema ops are not blocked |
 | Governance | `pause` (idempotent), `unpause`, `set_timelock`, `propose_admin_transfer`, `cancel_admin_transfer`, `force_admin_transfer`, `accept_admin_transfer` | Succeeds — governance must work to recover |
@@ -333,15 +354,14 @@ repeated routes from exceeding real available liquidity.
 - **InsufficientLiquidity:** The existing guard (`RouterError::InsufficientLiquidity`,
   code #12) fires when `amount > stored_liquidity`.
 - **Oracle top-up:** The oracle (or admin) can replenish liquidity at any
-  time via `set_pair_liquidity`. The new value overwrites whatever remains,
-  resetting the consumption window.
+  time via `set_pair_liquidity` (which overwrites whatever remains, resetting the consumption window) or increment it via `top_up_pair_liquidity` (which adds onto existing liquidity using `saturating_add` and preserves the `i128::MAX` sentinel value).
 
 ### Event reference
 
 | Topic | Data | Emitted by | Meaning |
 |-------|------|-----------|---------|
 | `liq_used` | `(source, destination, remaining_liquidity)` | `compute_route_fee` | Liquidity decremented by routed amount |
-| `liq_set` | `(source, destination, liquidity)` | `set_pair_liquidity` | Oracle/admin set/replenished liquidity |
+| `liq_set` | `(source, destination, liquidity)` | `set_pair_liquidity`, `top_up_pair_liquidity` | Oracle/admin set or incremented liquidity |
 
 ### `compute_route_fee` side-effect matrix
 
@@ -366,9 +386,7 @@ returns only the decoded payloads of events whose single topic is `route`.
 
 ### Pair lifecycle event and idempotency matrix
 
-Pair lifecycle tests assert the exact one-event payload emitted by each
-lifecycle entrypoint before any later contract call refreshes the host event
-buffer:
+`top_up_pair_liquidity` emits the same `liq_set` event with the new accumulated liquidity. Pair lifecycle tests assert the exact one-event payload emitted by each lifecycle entrypoint before any later contract call refreshes the host event buffer:
 
 | Entrypoint | Topic | Data payload | Test |
 |------------|-------|--------------|------|
@@ -376,6 +394,7 @@ buffer:
 | `register_pair` | `pair_reg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `set_pair_fee_bps` | `fee_set` | `(source, destination, fee_bps)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 | `set_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
+| `top_up_pair_liquidity` | `liq_set` | `(source, destination, liquidity)` | |
 | `set_pair_cooldown` | `cd_set` | `(source, destination, cooldown_secs)` | |
 | `unregister_pair` | `unreg` | `(source, destination)` | `test_pair_lifecycle_events_have_exact_payloads_and_counts` |
 
