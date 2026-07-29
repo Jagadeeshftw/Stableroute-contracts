@@ -105,6 +105,8 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `recip_set` | `recipient: Address` | `set_fee_recipient` |
 | `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity`, `top_up_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |
+| `metr_rm` | `(source, destination, route_count, volume): (Symbol, Symbol, u64, i128)` | `purge_pair_metrics` |
+| `pair_mrst` | `(source, destination): (Symbol, Symbol)` | `purge_pair_metrics` |
 | `tlock_set` | `(old_delay, new_delay): (u64, u64)` | `set_timelock` |
 
 ## Extended pair info (`PairInfoExt`)
