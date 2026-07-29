@@ -141,6 +141,7 @@ a short, abbreviated topic name.
 | `metr_rm` | `purge_pair_metrics` | `(source, destination, route_count, volume): (Symbol, Symbol, u64, i128)` |
 | `orac_set` | `set_oracle` | `oracle: Address` |
 | `orac_rm` | `remove_oracle` | `removed: Option<Address>` |
+| `tlock_set` | `set_timelock` | `(old_delay, new_delay): (u64, u64)` |
 | `pair_mrst` | `purge_pair_metrics` | `(source, destination): (Symbol, Symbol)` |
 | `upgraded` | `upgrade` | `new_wasm_hash: BytesN<32>` |
 
