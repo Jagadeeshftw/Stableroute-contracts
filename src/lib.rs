@@ -2639,7 +2639,9 @@ mod test {
         client.accept_admin_transfer(&next_admin); // still at t=1_000
     }
 
-    /// After the delay elapses, the handover executes normally.
+    /// After the delay elapses, the handover executes normally. Also pins
+    /// the exact-eta boundary: `t == eta` must succeed (the check is
+    /// `t < eta`, not `t <= eta`).
     #[test]
     fn test_timelock_allows_accept_after_delay() {
         let env = Env::default();
@@ -2652,6 +2654,69 @@ mod test {
         client.accept_admin_transfer(&next_admin);
         assert_eq!(client.get_admin(), Some(next_admin));
         assert_eq!(client.get_pending_admin_eta(), None);
+    }
+
+    // --- claim (admin-transfer) timelock boundaries ---
+
+    /// Zero boundary: the default (unset) timelock is `0`, so accept
+    /// succeeds at the exact same timestamp as the proposal — no implicit
+    /// minimum delay.
+    #[test]
+    fn test_claim_zero_timelock_boundary_accepts_immediately() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        assert_eq!(client.get_pending_admin_eta(), Some(1_000));
+        client.accept_admin_transfer(&next_admin); // no timestamp advance
+        assert_eq!(client.get_admin(), Some(next_admin));
+    }
+
+    /// Tightens `test_timelock_allows_accept_after_delay`'s exact-eta
+    /// success case from the other side: one second *before* eta must
+    /// still be rejected with `TimelockNotElapsed` (#14), not just any
+    /// earlier timestamp.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn test_claim_timelock_boundary_one_second_early_still_blocked() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        env.ledger().set_timestamp(1_099); // eta - 1
+        client.accept_admin_transfer(&next_admin);
+    }
+
+    /// Unguarded max boundary: unlike the per-pair cooldown (capped at
+    /// `MAX_COOLDOWN_SECS`), `set_timelock` enforces no upper bound at all.
+    /// An admin can set it to `u64::MAX`; `propose_admin_transfer`'s
+    /// `saturating_add` then clamps (rather than panics on overflow) the
+    /// eta to `u64::MAX`, which for all practical purposes permanently
+    /// blocks every future handover for that pending admin, since no
+    /// ledger timestamp will ever reach `u64::MAX`. Documented here as a
+    /// deliberate note rather than a fix, per this issue's "note any
+    /// unguarded boundary" scope.
+    #[test]
+    fn test_claim_timelock_max_value_is_unguarded_and_saturates_eta() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&u64::MAX);
+        assert_eq!(
+            client.get_timelock(),
+            u64::MAX,
+            "set_timelock enforces no upper bound"
+        );
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        assert_eq!(
+            client.get_pending_admin_eta(),
+            Some(u64::MAX),
+            "saturating_add clamps to u64::MAX instead of overflowing"
+        );
     }
 
     /// Cancelling a queued transfer clears both the pending admin and eta.
