@@ -87,6 +87,40 @@ stellar contract invoke \
   --fn unpause
 ```
 
+## Model and invariants
+
+The upgrade model has two independent entrypoints, each admin-gated but
+otherwise uncoupled from the other:
+
+- **`upgrade(new_wasm_hash)`** ([`src/lib.rs`](../src/lib.rs), `Self::upgrade`)
+  replaces the deployed WASM in place via
+  `env.deployer().update_current_contract_wasm`. It does not touch any
+  persistent state and does not bump `SchemaVersion`.
+- **`migrate_v1_to_v2()`** ([`src/lib.rs`](../src/lib.rs), `Self::migrate_v1_to_v2`)
+  stamps `DataKey::SchemaVersion` to `2`. It does not touch the deployed WASM.
+
+Invariants enforced by the code:
+
+1. **Admin-gated.** Both entrypoints call `Self::require_admin`, which loads
+   the stored admin and calls `require_auth()` on it. Neither entrypoint is
+   reachable by a non-admin caller.
+2. **Monotonic, one-shot migration.** `migrate_v1_to_v2` reads the current
+   `SchemaVersion` (defaulting to `1` when absent) and panics with
+   `RouterError::MigrationVersionMismatch` unless it is exactly `1`. This
+   makes the migration a strict `1 -> 2` transition: it cannot be re-run and
+   cannot be applied out of order.
+3. **Upgrade is not paused-gated, deliberately.** Every other state-changing
+   entrypoint calls `Self::require_not_paused` first; `upgrade` does not. The
+   code comment on `Self::upgrade` documents the trade-off: an emergency
+   pause should not block the admin from deploying the fix that resolves it,
+   and since only the admin can upgrade, this is not a privilege-escalation
+   path.
+4. **No implicit coupling.** Because `upgrade` and `migrate_v1_to_v2` are
+   independent, deploying new WASM does not implicitly migrate storage, and
+   migrating storage does not implicitly deploy new WASM. The runbook above
+   sequences them explicitly (WASM upgrade, then migration) precisely
+   because the contract does not enforce that ordering itself.
+
 ## Rollback
 
 Keep the contract paused until verification completes.

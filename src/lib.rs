@@ -82,6 +82,31 @@ pub struct RouterLimits {
     pub max_cooldown_secs: u64,
 }
 
+/// Aggregated read of the contract's global (non-pair-scoped) configuration:
+/// fee recipient, absolute fee bounds, liquidity oracle, and governance
+/// timelock delay. Lets callers fetch the whole admin-configured surface in
+/// a single invocation instead of five separate getter calls.
+///
+/// Every field reads its documented sane default when unset (see
+/// [`DataKey`]'s sentinel conventions), so this view is safe to call before
+/// any admin configuration has taken place.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalConfig {
+    /// Mirrors [`StableRouteRouter::get_fee_recipient`]. `None` when unset.
+    pub fee_recipient: Option<Address>,
+    /// Mirrors [`StableRouteRouter::get_max_fee_absolute`]. `None` when no
+    /// absolute ceiling is enforced.
+    pub max_fee_absolute: Option<i128>,
+    /// Mirrors [`StableRouteRouter::get_min_fee_absolute`]. `None` when no
+    /// absolute floor is enforced.
+    pub min_fee_absolute: Option<i128>,
+    /// Mirrors [`StableRouteRouter::get_oracle`]. `None` when unset.
+    pub oracle: Option<Address>,
+    /// Mirrors [`StableRouteRouter::get_timelock`]. Defaults to `0`.
+    pub timelock_secs: u64,
+}
+
 /// Storage keys used by the StableRoute router. Twenty-one variants total.
 /// Most live in persistent storage; three hot-global singletons
 /// ([`Admin`](DataKey::Admin), [`PendingAdmin`](DataKey::PendingAdmin),
@@ -165,6 +190,12 @@ pub enum DataKey {
     /// (singleton, `u64`, persistent). Incremented with `saturating_add`
     /// so it is monotonic and never panics. Defaults to `0`.
     TotalRoutesAllTime,
+    /// Protocol-wide lifetime sum of fees collected by `compute_route_fee`
+    /// (singleton, `i128`, persistent), owed to whoever holds
+    /// `FeeRecipient` once distributed off-chain. Accumulated with
+    /// `saturating_add` so it is monotonic and never panics on overflow.
+    /// Defaults to `0`.
+    RewardsAccrued,
     /// Ledger timestamp of the most recent `compute_route_fee` for a
     /// pair (keyed per-pair, `u64`, persistent). Used by the cooldown
     /// rate-limit gate. Absent reads as `None` (`Option`); `get_pair_info`
@@ -205,6 +236,12 @@ pub enum DataKey {
     /// seconds have elapsed since `PairLastRouteAt`. Capped at
     /// `MAX_COOLDOWN_SECS` (30 days). Defaults to `0` (disabled).
     PairCooldown(Symbol, Symbol),
+    /// `true` when `(source, destination)` has an active dispute flag
+    /// (keyed per-pair, `bool`, persistent). Set by `flag_pair_dispute`
+    /// and cleared by `resolve_pair_dispute` or `unregister_pair`. While
+    /// `true`, `quote_route` and `compute_route_fee` reject the pair with
+    /// `PairDisputed`. Defaults to `false`.
+    PairDisputed(Symbol, Symbol),
     /// Optional absolute per-route fee ceiling (singleton, `i128`,
     /// persistent). When set, the effective fee is `min(bps_fee, cap)`.
     /// Absent ↔ `None` (only the relative `MAX_FEE_BPS` bound applies).
@@ -314,6 +351,9 @@ pub enum RouterError {
     /// route free. Use [`StableRouteRouter::clear_max_fee_absolute`] to
     /// remove the cap entirely.
     ZeroFeeCap = 21,
+    /// `quote_route` or `compute_route_fee` was called for a pair with an
+    /// active dispute flag (see [`StableRouteRouter::flag_pair_dispute`]).
+    PairDisputed = 22,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -416,12 +456,22 @@ impl StableRouteRouter {
     }
 
     /// Cancel a pending handover, clearing both the pending admin and its
-    /// queued eta. No-op if none is pending.
+    /// queued eta. No-op (storage-wise) if none is pending.
+    ///
+    /// Emits a `cancelled` event carrying the pending admin and eta that
+    /// were cleared (both `None` on a no-op cancellation) — the third leg
+    /// of the propose (`queued`) / accept-or-force (`executed`) / cancel
+    /// (`cancelled`) event trail, so every claim-state transition is
+    /// observable on-chain, not just the two that previously had events.
     pub fn cancel_admin_transfer(env: Env) {
         Self::require_admin(&env);
+        let pending: Option<Address> = env.storage().instance().get(&DataKey::PendingAdmin);
+        let eta: Option<u64> = env.storage().persistent().get(&DataKey::PendingAdminEta);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage().persistent().remove(&DataKey::PendingAdminEta);
         Self::bump_instance_ttl(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"),), (pending, eta));
     }
 
     /// Step 2 of admin handover. The pending admin claims the role
@@ -429,24 +479,7 @@ impl StableRouteRouter {
     /// is pending or NotPendingAdmin if the caller does not match.
     pub fn accept_admin_transfer(env: Env, caller: Address) {
         caller.require_auth();
-        let pending: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NoPendingAdminTransfer));
-        if pending != caller {
-            panic_with_error!(&env, RouterError::NotPendingAdmin);
-        }
-        // Honour the governance timelock: the handover cannot execute until
-        // its stamped eta has been reached.
-        let eta: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingAdminEta)
-            .unwrap_or(0);
-        if env.ledger().timestamp() < eta {
-            panic_with_error!(&env, RouterError::TimelockNotElapsed);
-        }
+        Self::require_pending_admin_and_timelock_elapsed(&env, &caller);
         Self::finalize_admin_transfer(&env, caller);
     }
 
@@ -485,22 +518,7 @@ impl StableRouteRouter {
     /// so indexers can treat it identically.
     pub fn force_admin_transfer(env: Env, new_admin: Address) {
         Self::require_admin(&env);
-        let pending: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NoPendingAdminTransfer));
-        if pending != new_admin {
-            panic_with_error!(&env, RouterError::NotPendingAdmin);
-        }
-        let eta: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingAdminEta)
-            .unwrap_or(0);
-        if env.ledger().timestamp() < eta {
-            panic_with_error!(&env, RouterError::TimelockNotElapsed);
-        }
+        Self::require_pending_admin_and_timelock_elapsed(&env, &new_admin);
         Self::finalize_admin_transfer(&env, new_admin);
     }
 
@@ -549,7 +567,10 @@ impl StableRouteRouter {
     ///
     /// Admin-gated; rejects `source == destination`. Idempotent: a
     /// second call with the same pair simply re-asserts the entry and
-    /// is a no-op from the caller's perspective.
+    /// is a no-op from the caller's perspective, including on events —
+    /// `pair_reg` fires only on the transition from unregistered to
+    /// registered, never on a redundant re-assertion of an already
+    /// registered pair.
     ///
     /// **Registration-first invariant:** `set_pair_fee_bps`,
     /// `set_pair_min_amount`, `set_pair_max_amount`, and
@@ -563,16 +584,21 @@ impl StableRouteRouter {
         if source == destination {
             panic_with_error!(&env, RouterError::SourceEqualsDestination);
         }
+        let already_registered = Self::read_pair_registered(&env, &source, &destination);
         env.storage()
             .persistent()
             .set(&DataKey::Pair(source.clone(), destination.clone()), &true);
-        env.events()
-            .publish((symbol_short!("pair_reg"),), (source, destination));
+        if !already_registered {
+            env.events()
+                .publish((symbol_short!("pair_reg"),), (source, destination));
+        }
     }
 
     /// Register multiple `(source, destination)` pairs in a single
     /// admin-gated call. Each entry is validated identically to
-    /// [`Self::register_pair`] and gets its own `pair_reg` event.
+    /// [`Self::register_pair`] and gets its own `pair_reg` event, with the
+    /// same no-duplicate-emission rule: an entry that is already registered
+    /// re-asserts silently instead of re-firing the event.
     ///
     /// **All-or-nothing:** if any entry fails validation the entire
     /// transaction is rolled back (Soroban transactions are atomic), so
@@ -594,11 +620,14 @@ impl StableRouteRouter {
             if source == destination {
                 panic_with_error!(&env, RouterError::SourceEqualsDestination);
             }
+            let already_registered = Self::read_pair_registered(&env, &source, &destination);
             env.storage()
                 .persistent()
                 .set(&DataKey::Pair(source.clone(), destination.clone()), &true);
-            env.events()
-                .publish((symbol_short!("pair_reg"),), (source, destination));
+            if !already_registered {
+                env.events()
+                    .publish((symbol_short!("pair_reg"),), (source, destination));
+            }
         }
     }
 
@@ -624,15 +653,53 @@ impl StableRouteRouter {
         );
     }
 
+    /// Admin flags `(source, destination)` as disputed. While disputed,
+    /// [`Self::quote_route`] and [`Self::compute_route_fee`] reject the
+    /// pair with [`RouterError::PairDisputed`] until
+    /// [`Self::resolve_pair_dispute`] clears the flag. Requires the pair
+    /// to already be registered.
+    ///
+    /// Idempotent on the event: flagging an already-disputed pair
+    /// re-asserts the flag but does not re-emit `disp_set`.
+    pub fn flag_pair_dispute(env: Env, source: Symbol, destination: Symbol) {
+        Self::require_admin(&env);
+        Self::require_pair_registered(&env, &source, &destination);
+        let already_disputed = Self::read_pair_disputed(&env, &source, &destination);
+        env.storage().persistent().set(
+            &DataKey::PairDisputed(source.clone(), destination.clone()),
+            &true,
+        );
+        if !already_disputed {
+            env.events()
+                .publish((symbol_short!("disp_set"),), (source, destination, true));
+        }
+    }
+
+    /// Admin clears a dispute flag, restoring normal routing and quoting
+    /// for the pair.
+    ///
+    /// Idempotent: resolving a pair with no active dispute is a clean
+    /// no-op that does not emit `disp_set`.
+    pub fn resolve_pair_dispute(env: Env, source: Symbol, destination: Symbol) {
+        Self::require_admin(&env);
+        let was_disputed = Self::read_pair_disputed(&env, &source, &destination);
+        env.storage().persistent().set(
+            &DataKey::PairDisputed(source.clone(), destination.clone()),
+            &false,
+        );
+        if was_disputed {
+            env.events()
+                .publish((symbol_short!("disp_set"),), (source, destination, false));
+        }
+    }
+
     /// Configure an absolute upper bound on the fee charged for any route.
     ///
     /// Admin-gated. The computed fee is clamped to this value after the
     /// percentage-based calculation.
     pub fn set_max_fee_absolute(env: Env, max_fee: i128) {
         Self::require_admin(&env);
-        if max_fee < 0 {
-            panic_with_error!(&env, RouterError::AmountMustBePositive);
-        }
+        Self::require_non_negative_fee(&env, max_fee);
         if max_fee == 0 {
             panic_with_error!(&env, RouterError::ZeroFeeCap);
         }
@@ -665,9 +732,7 @@ impl StableRouteRouter {
     /// percentage-based fee would be lower.
     pub fn set_min_fee_absolute(env: Env, min_fee: i128) {
         Self::require_admin(&env);
-        if min_fee < 0 {
-            panic_with_error!(&env, RouterError::AmountMustBePositive);
-        }
+        Self::require_non_negative_fee(&env, min_fee);
         env.storage()
             .persistent()
             .set(&DataKey::MinFeeAbsolute, &min_fee);
@@ -1020,6 +1085,18 @@ impl StableRouteRouter {
             .unwrap_or(0)
     }
 
+    /// Read-only view of the protocol-wide lifetime sum of fees accrued by
+    /// `compute_route_fee`, owed to `FeeRecipient` once distributed.
+    ///
+    /// Does not mutate storage. Returns `0` before any fee-bearing route
+    /// has been processed.
+    pub fn get_rewards_accrued(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RewardsAccrued)
+            .unwrap_or(0)
+    }
+
     /// Returns the number of successful routes executed for the specified pair.
     ///
     /// Returns `0` if the pair has never been routed.
@@ -1097,12 +1174,36 @@ impl StableRouteRouter {
         Self::read_pair_registered(&env, &source, &destination)
     }
 
+    /// Returns `true` if `(source, destination)` currently has an active
+    /// dispute flag set via [`Self::flag_pair_dispute`].
+    ///
+    /// Does not mutate storage. Defaults to `false`.
+    pub fn is_pair_disputed(env: Env, source: Symbol, destination: Symbol) -> bool {
+        Self::read_pair_disputed(&env, &source, &destination)
+    }
+
     /// Returns the configured routing fee for the pair, expressed in basis
     /// points.
     ///
     /// Returns `0` when no fee has been configured.
     pub fn get_pair_fee_bps(env: Env, source: Symbol, destination: Symbol) -> u32 {
         Self::read_pair_fee_bps(&env, &source, &destination)
+    }
+
+    /// Read-only aggregate of the contract's global configuration: fee
+    /// recipient, absolute fee bounds, oracle, and timelock delay.
+    ///
+    /// Does not mutate storage. Every field reads its documented sane
+    /// default (see [`GlobalConfig`]), so this is safe to call before any
+    /// admin configuration has taken place.
+    pub fn get_global_config(env: Env) -> GlobalConfig {
+        GlobalConfig {
+            fee_recipient: env.storage().persistent().get(&DataKey::FeeRecipient),
+            max_fee_absolute: Self::read_max_fee_cap(&env),
+            min_fee_absolute: env.storage().persistent().get(&DataKey::MinFeeAbsolute),
+            oracle: env.storage().persistent().get(&DataKey::Oracle),
+            timelock_secs: Self::get_timelock(env.clone()),
+        }
     }
 
     // ── Routing ───────────────────────────────────────────────────────────
@@ -1125,6 +1226,9 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::AmountMustBePositive);
         }
         Self::require_pair_registered(&env, &source, &destination);
+        if Self::read_pair_disputed(&env, &source, &destination) {
+            panic_with_error!(&env, RouterError::PairDisputed);
+        }
         if matches!(
             env.storage()
                 .persistent()
@@ -1211,6 +1315,9 @@ impl StableRouteRouter {
         if !Self::read_pair_registered(&env, &source, &destination) {
             Self::route_abort(&env, RouterError::PairNotRegistered);
         }
+        if Self::read_pair_disputed(&env, &source, &destination) {
+            Self::route_abort(&env, RouterError::PairDisputed);
+        }
         let min_amount = Self::read_pair_min(&env, &source, &destination);
         if amount < min_amount {
             Self::route_abort(&env, RouterError::AmountBelowMin);
@@ -1295,6 +1402,22 @@ impl StableRouteRouter {
         env.storage()
             .persistent()
             .set(&DataKey::TotalRoutesAllTime, &total.saturating_add(1));
+
+        // A zero fee is not a rewards-state change: skip the write and
+        // the event entirely rather than recording a no-op accrual.
+        if fee > 0 {
+            let accrued: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RewardsAccrued)
+                .unwrap_or(0);
+            let new_accrued = accrued.saturating_add(fee);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RewardsAccrued, &new_accrued);
+            env.events()
+                .publish((symbol_short!("rwd_accr"),), (fee, new_accrued));
+        }
 
         // Construct the route-count key once — shared between read and write.
         let route_count_key = DataKey::PairRouteCount(source.clone(), destination.clone());
@@ -1422,6 +1545,22 @@ impl StableRouteRouter {
         }
     }
 
+    /// Require that a fee-bound value (the router's reward parameters —
+    /// [`Self::set_max_fee_absolute`] and [`Self::set_min_fee_absolute`]
+    /// both configure an absolute bound on the fee the router charges/earns
+    /// per route) is not negative; panics with
+    /// [`RouterError::AmountMustBePositive`] otherwise.
+    ///
+    /// Both setters previously repeated this exact `< 0` check inline. A
+    /// negative fee bound would be nonsensical (a route could never be
+    /// charged less than a negative amount), so this is enforced
+    /// identically at both call sites via one shared helper.
+    fn require_non_negative_fee(env: &Env, value: i128) {
+        if value < 0 {
+            panic_with_error!(env, RouterError::AmountMustBePositive);
+        }
+    }
+
     /// Acquire the reentrancy lock; panics [`RouterError::ReentrantCall`]
     /// if already held. Paired with [`Self::exit_nonreentrant`] on every
     /// return path so that a re-entrant invocation (for example via a
@@ -1484,6 +1623,35 @@ impl StableRouteRouter {
         }
     }
 
+    /// Require that `expected` is the currently pending admin and that the
+    /// governance timelock eta has elapsed; panics with
+    /// [`RouterError::NoPendingAdminTransfer`] if no handover is pending,
+    /// [`RouterError::NotPendingAdmin`] if `expected` does not match the
+    /// pending admin, or [`RouterError::TimelockNotElapsed`] if the eta has
+    /// not yet been reached. Shared precondition check of
+    /// [`Self::accept_admin_transfer`] (self-accept) and
+    /// [`Self::force_admin_transfer`] (admin-forced) — the two entrypoints
+    /// that complete a proposed handover — which previously repeated this
+    /// exact lookup/compare/timelock sequence inline.
+    fn require_pending_admin_and_timelock_elapsed(env: &Env, expected: &Address) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(env, RouterError::NoPendingAdminTransfer));
+        if &pending != expected {
+            panic_with_error!(env, RouterError::NotPendingAdmin);
+        }
+        let eta: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminEta)
+            .unwrap_or(0);
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(env, RouterError::TimelockNotElapsed);
+        }
+    }
+
     /// Finalise an admin handover: install `new_admin`, clear the pending
     /// slots, renew the instance TTL, and emit the `executed` event. Shared
     /// tail of [`Self::accept_admin_transfer`] and
@@ -1507,6 +1675,18 @@ impl StableRouteRouter {
         env.storage()
             .persistent()
             .get(&DataKey::Pair(source.clone(), destination.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Read whether `(source, destination)` currently has an active
+    /// dispute flag. Single source of truth for the
+    /// [`DataKey::PairDisputed`] sentinel value; shared by `quote_route`
+    /// and `compute_route_fee` instead of each inlining its own storage
+    /// read.
+    fn read_pair_disputed(env: &Env, source: &Symbol, destination: &Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairDisputed(source.clone(), destination.clone()))
             .unwrap_or(false)
     }
 
@@ -1619,7 +1799,8 @@ impl StableRouteRouter {
         storage.remove(&DataKey::PairMinAmount(source.clone(), destination.clone()));
         storage.remove(&DataKey::PairMaxAmount(source.clone(), destination.clone()));
         storage.remove(&DataKey::PairLiquidity(source.clone(), destination.clone()));
-        storage.remove(&DataKey::PairCooldown(source, destination));
+        storage.remove(&DataKey::PairCooldown(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairDisputed(source, destination));
     }
 
     /// Remove a registered pair from the router.
@@ -2254,12 +2435,145 @@ mod test {
         assert!(client.is_pair_registered(&symbol_short!("USDC"), &symbol_short!("EURC")));
     }
 
+    /// A re-registration of an already-registered pair must not re-emit
+    /// `pair_reg`: exactly one `pair_reg` event across two calls on the
+    /// same pair.
+    #[test]
+    fn test_register_pair_does_not_duplicate_event_on_reregistration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.register_pair(&s, &d);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("pair_reg")).len(),
+            1,
+            "re-registering an already-registered pair must not emit a second pair_reg event"
+        );
+    }
+
+    /// Batch-registering a mix of one already-registered and one fresh pair
+    /// emits `pair_reg` only for the genuinely new registration.
+    #[test]
+    fn test_register_pairs_does_not_duplicate_event_on_reregistration() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        let mut batch = Vec::new(&env);
+        batch.push_back((s.clone(), d.clone()));
+        batch.push_back((symbol_short!("XLM"), symbol_short!("USDC")));
+        client.register_pairs(&batch);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("pair_reg")).len(),
+            2,
+            "one pair_reg for register_pair plus one for the fresh entry in register_pairs; \
+             the already-registered entry must not re-fire"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn test_register_pair_rejects_identity() {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("USDC"));
+    }
+
+    // --- dispute flag ---
+
+    #[test]
+    fn test_is_pair_disputed_defaults_to_false() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        assert!(!client.is_pair_disputed(&s, &d));
+    }
+
+    #[test]
+    fn test_flag_pair_dispute_blocks_quote_and_compute() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        assert!(client.is_pair_disputed(&s, &d));
+
+        let quote_result = client.try_quote_route(&s, &d, &1_000i128);
+        assert!(quote_result.is_err(), "disputed pair must reject quote_route");
+
+        let compute_result = client.try_compute_route_fee(&s, &d, &1_000i128);
+        assert!(
+            compute_result.is_err(),
+            "disputed pair must reject compute_route_fee"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pair_dispute_restores_routing() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        client.resolve_pair_dispute(&s, &d);
+        assert!(!client.is_pair_disputed(&s, &d));
+        // Routing works again once resolved.
+        client.quote_route(&s, &d, &1_000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_flag_pair_dispute_requires_registered_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.flag_pair_dispute(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    #[test]
+    fn test_flag_pair_dispute_does_not_duplicate_event_on_reflag() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("disp_set")).len(),
+            1,
+            "re-flagging an already-disputed pair must not emit a second disp_set event"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pair_dispute_on_undisputed_pair_is_noop_without_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.resolve_pair_dispute(&s, &d);
+        assert!(!client.is_pair_disputed(&s, &d));
+        assert_eq!(
+            event_payloads(&env, symbol_short!("disp_set")).len(),
+            0,
+            "resolving a pair with no active dispute must not emit disp_set"
+        );
+    }
+
+    #[test]
+    fn test_unregister_pair_clears_dispute_flag() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        client.unregister_pair(&s, &d);
+        client.register_pair(&s, &d);
+        assert!(
+            !client.is_pair_disputed(&s, &d),
+            "re-registering after unregister must not inherit a stale dispute flag"
+        );
     }
 
     #[test]
@@ -2317,6 +2631,80 @@ mod test {
             &1_000_000_i128,
         );
         assert_eq!(fee, 5_000);
+    }
+
+    // --- rewards accrual ---
+
+    #[test]
+    fn test_rewards_accrued_defaults_to_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(client.get_rewards_accrued(), 0);
+    }
+
+    #[test]
+    fn test_rewards_accrued_accumulates_across_routes() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        let fee1 = client.compute_route_fee(&s, &d, &1_000_000_i128);
+        assert_eq!(client.get_rewards_accrued(), fee1);
+        let fee2 = client.compute_route_fee(&s, &d, &2_000_000_i128);
+        assert_eq!(client.get_rewards_accrued(), fee1 + fee2);
+    }
+
+    #[test]
+    fn test_rewards_accrued_unaffected_by_zero_fee_route() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        // No fee_bps set — every route is free.
+        let fee = client.compute_route_fee(&s, &d, &1_000_000_i128);
+        assert_eq!(fee, 0);
+        assert_eq!(client.get_rewards_accrued(), 0);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("rwd_accr")).len(),
+            0,
+            "a zero-fee route must not emit rwd_accr"
+        );
+    }
+
+    #[test]
+    fn test_rewards_accrued_event_carries_fee_and_running_total() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        let fee = client.compute_route_fee(&s, &d, &1_000_000_i128);
+        let payloads = event_payloads(&env, symbol_short!("rwd_accr"));
+        assert_eq!(payloads.len(), 1, "one rwd_accr event for one fee-bearing route");
+        let (emitted_fee, emitted_total): (i128, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("rwd_accr payload decodes to (fee, running_total)");
+        assert_eq!(emitted_fee, fee);
+        assert_eq!(emitted_total, client.get_rewards_accrued());
+    }
+
+    /// Over-limit boundary: accrual must saturate at `i128::MAX` instead of
+    /// panicking on overflow.
+    #[test]
+    fn test_rewards_accrued_saturates_instead_of_overflowing() {
+        let env = Env::default();
+        let (client, _admin, contract_id) = setup_initialized_with_id(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RewardsAccrued, &(i128::MAX - 10));
+        });
+        client.compute_route_fee(&s, &d, &1_000_000_i128);
+        assert_eq!(client.get_rewards_accrued(), i128::MAX);
     }
 
     #[test]
@@ -2698,7 +3086,9 @@ mod test {
         client.accept_admin_transfer(&next_admin); // still at t=1_000
     }
 
-    /// After the delay elapses, the handover executes normally.
+    /// After the delay elapses, the handover executes normally. Also pins
+    /// the exact-eta boundary: `t == eta` must succeed (the check is
+    /// `t < eta`, not `t <= eta`).
     #[test]
     fn test_timelock_allows_accept_after_delay() {
         let env = Env::default();
@@ -2711,6 +3101,69 @@ mod test {
         client.accept_admin_transfer(&next_admin);
         assert_eq!(client.get_admin(), Some(next_admin));
         assert_eq!(client.get_pending_admin_eta(), None);
+    }
+
+    // --- claim (admin-transfer) timelock boundaries ---
+
+    /// Zero boundary: the default (unset) timelock is `0`, so accept
+    /// succeeds at the exact same timestamp as the proposal — no implicit
+    /// minimum delay.
+    #[test]
+    fn test_claim_zero_timelock_boundary_accepts_immediately() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        assert_eq!(client.get_pending_admin_eta(), Some(1_000));
+        client.accept_admin_transfer(&next_admin); // no timestamp advance
+        assert_eq!(client.get_admin(), Some(next_admin));
+    }
+
+    /// Tightens `test_timelock_allows_accept_after_delay`'s exact-eta
+    /// success case from the other side: one second *before* eta must
+    /// still be rejected with `TimelockNotElapsed` (#14), not just any
+    /// earlier timestamp.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn test_claim_timelock_boundary_one_second_early_still_blocked() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        env.ledger().set_timestamp(1_099); // eta - 1
+        client.accept_admin_transfer(&next_admin);
+    }
+
+    /// Unguarded max boundary: unlike the per-pair cooldown (capped at
+    /// `MAX_COOLDOWN_SECS`), `set_timelock` enforces no upper bound at all.
+    /// An admin can set it to `u64::MAX`; `propose_admin_transfer`'s
+    /// `saturating_add` then clamps (rather than panics on overflow) the
+    /// eta to `u64::MAX`, which for all practical purposes permanently
+    /// blocks every future handover for that pending admin, since no
+    /// ledger timestamp will ever reach `u64::MAX`. Documented here as a
+    /// deliberate note rather than a fix, per this issue's "note any
+    /// unguarded boundary" scope.
+    #[test]
+    fn test_claim_timelock_max_value_is_unguarded_and_saturates_eta() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&u64::MAX);
+        assert_eq!(
+            client.get_timelock(),
+            u64::MAX,
+            "set_timelock enforces no upper bound"
+        );
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        assert_eq!(
+            client.get_pending_admin_eta(),
+            Some(u64::MAX),
+            "saturating_add clamps to u64::MAX instead of overflowing"
+        );
     }
 
     /// Cancelling a queued transfer clears both the pending admin and eta.
@@ -3638,6 +4091,55 @@ mod test {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
         client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &-1i128);
+    }
+
+    #[test]
+    fn test_set_pair_min_amount_allows_zero_boundary() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_min_amount(&s, &d, &0i128);
+        assert_eq!(client.get_pair_min_amount(&s, &d), 0);
+    }
+
+    #[test]
+    fn test_set_pair_fee_bps_allows_zero_boundary() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &0u32);
+        assert_eq!(client.get_pair_fee_bps(&s, &d), 0);
+    }
+
+    #[test]
+    fn test_set_pair_fee_bps_allows_at_exact_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &MAX_FEE_BPS);
+        assert_eq!(client.get_pair_fee_bps(&s, &d), MAX_FEE_BPS);
+    }
+
+    #[test]
+    fn test_set_pair_cooldown_allows_at_exact_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &MAX_COOLDOWN_SECS);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_set_pair_cooldown_rejects_over_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &(MAX_COOLDOWN_SECS + 1));
     }
 
     // --- compute_route_fee side-effect tests ---
@@ -4832,6 +5334,53 @@ mod read_surface {
         assert_eq!(info.max_amount, ext.max_amount);
         assert_eq!(info.liquidity, ext.liquidity);
         assert_eq!(info.last_route_at, ext.last_route_at);
+    }
+
+    #[test]
+    fn test_global_config_defaults_before_any_admin_configuration() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let config = client.get_global_config();
+        assert_eq!(
+            config,
+            GlobalConfig {
+                fee_recipient: None,
+                max_fee_absolute: None,
+                min_fee_absolute: None,
+                oracle: None,
+                timelock_secs: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_global_config_reflects_configured_values() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let recipient = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.set_fee_recipient(&recipient);
+        client.set_max_fee_absolute(&500i128);
+        client.set_min_fee_absolute(&10i128);
+        client.set_oracle(&oracle);
+        client.set_timelock(&3_600u64);
+
+        let config = client.get_global_config();
+        assert_eq!(config.fee_recipient, Some(recipient));
+        assert_eq!(config.max_fee_absolute, Some(500i128));
+        assert_eq!(config.min_fee_absolute, Some(10i128));
+        assert_eq!(config.oracle, Some(oracle));
+        assert_eq!(config.timelock_secs, 3_600u64);
+    }
+
+    #[test]
+    fn test_global_config_does_not_mutate_storage() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let before = client.get_global_config();
+        // Calling the view twice must be side-effect free and stable.
+        let after = client.get_global_config();
+        assert_eq!(before, after);
     }
 }
 
