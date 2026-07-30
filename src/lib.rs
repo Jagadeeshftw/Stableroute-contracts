@@ -165,6 +165,12 @@ pub enum DataKey {
     /// (singleton, `u64`, persistent). Incremented with `saturating_add`
     /// so it is monotonic and never panics. Defaults to `0`.
     TotalRoutesAllTime,
+    /// Protocol-wide lifetime sum of fees collected by `compute_route_fee`
+    /// (singleton, `i128`, persistent), owed to whoever holds
+    /// `FeeRecipient` once distributed off-chain. Accumulated with
+    /// `saturating_add` so it is monotonic and never panics on overflow.
+    /// Defaults to `0`.
+    RewardsAccrued,
     /// Ledger timestamp of the most recent `compute_route_fee` for a
     /// pair (keyed per-pair, `u64`, persistent). Used by the cooldown
     /// rate-limit gate. Absent reads as `None` (`Option`); `get_pair_info`
@@ -994,6 +1000,18 @@ impl StableRouteRouter {
             .unwrap_or(0)
     }
 
+    /// Read-only view of the protocol-wide lifetime sum of fees accrued by
+    /// `compute_route_fee`, owed to `FeeRecipient` once distributed.
+    ///
+    /// Does not mutate storage. Returns `0` before any fee-bearing route
+    /// has been processed.
+    pub fn get_rewards_accrued(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RewardsAccrued)
+            .unwrap_or(0)
+    }
+
     /// Returns the number of successful routes executed for the specified pair.
     ///
     /// Returns `0` if the pair has never been routed.
@@ -1269,6 +1287,22 @@ impl StableRouteRouter {
         env.storage()
             .persistent()
             .set(&DataKey::TotalRoutesAllTime, &total.saturating_add(1));
+
+        // A zero fee is not a rewards-state change: skip the write and
+        // the event entirely rather than recording a no-op accrual.
+        if fee > 0 {
+            let accrued: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RewardsAccrued)
+                .unwrap_or(0);
+            let new_accrued = accrued.saturating_add(fee);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RewardsAccrued, &new_accrued);
+            env.events()
+                .publish((symbol_short!("rwd_accr"),), (fee, new_accrued));
+        }
 
         // Construct the route-count key once — shared between read and write.
         let route_count_key = DataKey::PairRouteCount(source.clone(), destination.clone());
@@ -2336,6 +2370,80 @@ mod test {
             &1_000_000_i128,
         );
         assert_eq!(fee, 5_000);
+    }
+
+    // --- rewards accrual ---
+
+    #[test]
+    fn test_rewards_accrued_defaults_to_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(client.get_rewards_accrued(), 0);
+    }
+
+    #[test]
+    fn test_rewards_accrued_accumulates_across_routes() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        let fee1 = client.compute_route_fee(&s, &d, &1_000_000_i128);
+        assert_eq!(client.get_rewards_accrued(), fee1);
+        let fee2 = client.compute_route_fee(&s, &d, &2_000_000_i128);
+        assert_eq!(client.get_rewards_accrued(), fee1 + fee2);
+    }
+
+    #[test]
+    fn test_rewards_accrued_unaffected_by_zero_fee_route() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        // No fee_bps set — every route is free.
+        let fee = client.compute_route_fee(&s, &d, &1_000_000_i128);
+        assert_eq!(fee, 0);
+        assert_eq!(client.get_rewards_accrued(), 0);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("rwd_accr")).len(),
+            0,
+            "a zero-fee route must not emit rwd_accr"
+        );
+    }
+
+    #[test]
+    fn test_rewards_accrued_event_carries_fee_and_running_total() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        let fee = client.compute_route_fee(&s, &d, &1_000_000_i128);
+        let payloads = event_payloads(&env, symbol_short!("rwd_accr"));
+        assert_eq!(payloads.len(), 1, "one rwd_accr event for one fee-bearing route");
+        let (emitted_fee, emitted_total): (i128, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("rwd_accr payload decodes to (fee, running_total)");
+        assert_eq!(emitted_fee, fee);
+        assert_eq!(emitted_total, client.get_rewards_accrued());
+    }
+
+    /// Over-limit boundary: accrual must saturate at `i128::MAX` instead of
+    /// panicking on overflow.
+    #[test]
+    fn test_rewards_accrued_saturates_instead_of_overflowing() {
+        let env = Env::default();
+        let (client, _admin, contract_id) = setup_initialized_with_id(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &50u32);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RewardsAccrued, &(i128::MAX - 10));
+        });
+        client.compute_route_fee(&s, &d, &1_000_000_i128);
+        assert_eq!(client.get_rewards_accrued(), i128::MAX);
     }
 
     #[test]
