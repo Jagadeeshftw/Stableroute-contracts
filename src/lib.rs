@@ -82,6 +82,31 @@ pub struct RouterLimits {
     pub max_cooldown_secs: u64,
 }
 
+/// Aggregated read of the contract's global (non-pair-scoped) configuration:
+/// fee recipient, absolute fee bounds, liquidity oracle, and governance
+/// timelock delay. Lets callers fetch the whole admin-configured surface in
+/// a single invocation instead of five separate getter calls.
+///
+/// Every field reads its documented sane default when unset (see
+/// [`DataKey`]'s sentinel conventions), so this view is safe to call before
+/// any admin configuration has taken place.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalConfig {
+    /// Mirrors [`StableRouteRouter::get_fee_recipient`]. `None` when unset.
+    pub fee_recipient: Option<Address>,
+    /// Mirrors [`StableRouteRouter::get_max_fee_absolute`]. `None` when no
+    /// absolute ceiling is enforced.
+    pub max_fee_absolute: Option<i128>,
+    /// Mirrors [`StableRouteRouter::get_min_fee_absolute`]. `None` when no
+    /// absolute floor is enforced.
+    pub min_fee_absolute: Option<i128>,
+    /// Mirrors [`StableRouteRouter::get_oracle`]. `None` when unset.
+    pub oracle: Option<Address>,
+    /// Mirrors [`StableRouteRouter::get_timelock`]. Defaults to `0`.
+    pub timelock_secs: u64,
+}
+
 /// Storage keys used by the StableRoute router. Twenty-one variants total.
 /// Most live in persistent storage; three hot-global singletons
 /// ([`Admin`](DataKey::Admin), [`PendingAdmin`](DataKey::PendingAdmin),
@@ -1163,6 +1188,22 @@ impl StableRouteRouter {
     /// Returns `0` when no fee has been configured.
     pub fn get_pair_fee_bps(env: Env, source: Symbol, destination: Symbol) -> u32 {
         Self::read_pair_fee_bps(&env, &source, &destination)
+    }
+
+    /// Read-only aggregate of the contract's global configuration: fee
+    /// recipient, absolute fee bounds, oracle, and timelock delay.
+    ///
+    /// Does not mutate storage. Every field reads its documented sane
+    /// default (see [`GlobalConfig`]), so this is safe to call before any
+    /// admin configuration has taken place.
+    pub fn get_global_config(env: Env) -> GlobalConfig {
+        GlobalConfig {
+            fee_recipient: env.storage().persistent().get(&DataKey::FeeRecipient),
+            max_fee_absolute: Self::read_max_fee_cap(&env),
+            min_fee_absolute: env.storage().persistent().get(&DataKey::MinFeeAbsolute),
+            oracle: env.storage().persistent().get(&DataKey::Oracle),
+            timelock_secs: Self::get_timelock(env.clone()),
+        }
     }
 
     // ── Routing ───────────────────────────────────────────────────────────
@@ -5280,6 +5321,53 @@ mod read_surface {
         assert_eq!(info.max_amount, ext.max_amount);
         assert_eq!(info.liquidity, ext.liquidity);
         assert_eq!(info.last_route_at, ext.last_route_at);
+    }
+
+    #[test]
+    fn test_global_config_defaults_before_any_admin_configuration() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let config = client.get_global_config();
+        assert_eq!(
+            config,
+            GlobalConfig {
+                fee_recipient: None,
+                max_fee_absolute: None,
+                min_fee_absolute: None,
+                oracle: None,
+                timelock_secs: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_global_config_reflects_configured_values() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let recipient = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.set_fee_recipient(&recipient);
+        client.set_max_fee_absolute(&500i128);
+        client.set_min_fee_absolute(&10i128);
+        client.set_oracle(&oracle);
+        client.set_timelock(&3_600u64);
+
+        let config = client.get_global_config();
+        assert_eq!(config.fee_recipient, Some(recipient));
+        assert_eq!(config.max_fee_absolute, Some(500i128));
+        assert_eq!(config.min_fee_absolute, Some(10i128));
+        assert_eq!(config.oracle, Some(oracle));
+        assert_eq!(config.timelock_secs, 3_600u64);
+    }
+
+    #[test]
+    fn test_global_config_does_not_mutate_storage() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let before = client.get_global_config();
+        // Calling the view twice must be side-effect free and stable.
+        let after = client.get_global_config();
+        assert_eq!(before, after);
     }
 }
 
