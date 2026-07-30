@@ -2584,6 +2584,65 @@ mod test {
         assert_eq!(client.get_pending_admin_eta(), None);
     }
 
+    // --- get_pending_admin_info (aggregated claim-state view) ---
+
+    /// Before any transfer is proposed, the aggregated view returns the
+    /// same sane `None`/`None` default as the two individual getters.
+    #[test]
+    fn test_pending_admin_info_default_before_any_transfer() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        assert_eq!(
+            client.get_pending_admin_info(),
+            PendingAdminInfo {
+                pending: None,
+                eta: None
+            }
+        );
+    }
+
+    /// Once a transfer is queued, the aggregated view is a consistent
+    /// snapshot of both individual getters.
+    #[test]
+    fn test_pending_admin_info_reflects_queued_transfer() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+
+        let info = client.get_pending_admin_info();
+        assert_eq!(info.pending, client.get_pending_admin());
+        assert_eq!(info.eta, client.get_pending_admin_eta());
+        assert_eq!(
+            info,
+            PendingAdminInfo {
+                pending: Some(next_admin),
+                eta: Some(1_100)
+            }
+        );
+    }
+
+    /// The aggregated view reverts to the default once the transfer
+    /// completes (mirrors the individual-getter coverage in
+    /// `test_admin_transfer_flow`).
+    #[test]
+    fn test_pending_admin_info_clears_after_accept() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        client.accept_admin_transfer(&next_admin);
+        assert_eq!(
+            client.get_pending_admin_info(),
+            PendingAdminInfo {
+                pending: None,
+                eta: None
+            }
+        );
+    }
+
     // --- #21: governance timelock ---
 
     /// Timelock defaults to 0 (instant handover) when unset.
