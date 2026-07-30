@@ -205,6 +205,12 @@ pub enum DataKey {
     /// seconds have elapsed since `PairLastRouteAt`. Capped at
     /// `MAX_COOLDOWN_SECS` (30 days). Defaults to `0` (disabled).
     PairCooldown(Symbol, Symbol),
+    /// `true` when `(source, destination)` has an active dispute flag
+    /// (keyed per-pair, `bool`, persistent). Set by `flag_pair_dispute`
+    /// and cleared by `resolve_pair_dispute` or `unregister_pair`. While
+    /// `true`, `quote_route` and `compute_route_fee` reject the pair with
+    /// `PairDisputed`. Defaults to `false`.
+    PairDisputed(Symbol, Symbol),
     /// Optional absolute per-route fee ceiling (singleton, `i128`,
     /// persistent). When set, the effective fee is `min(bps_fee, cap)`.
     /// Absent ↔ `None` (only the relative `MAX_FEE_BPS` bound applies).
@@ -314,6 +320,9 @@ pub enum RouterError {
     /// route free. Use [`StableRouteRouter::clear_max_fee_absolute`] to
     /// remove the cap entirely.
     ZeroFeeCap = 21,
+    /// `quote_route` or `compute_route_fee` was called for a pair with an
+    /// active dispute flag (see [`StableRouteRouter::flag_pair_dispute`]).
+    PairDisputed = 22,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -622,6 +631,46 @@ impl StableRouteRouter {
             (symbol_short!("cd_set"),),
             (source, destination, cooldown_secs),
         );
+    }
+
+    /// Admin flags `(source, destination)` as disputed. While disputed,
+    /// [`Self::quote_route`] and [`Self::compute_route_fee`] reject the
+    /// pair with [`RouterError::PairDisputed`] until
+    /// [`Self::resolve_pair_dispute`] clears the flag. Requires the pair
+    /// to already be registered.
+    ///
+    /// Idempotent on the event: flagging an already-disputed pair
+    /// re-asserts the flag but does not re-emit `disp_set`.
+    pub fn flag_pair_dispute(env: Env, source: Symbol, destination: Symbol) {
+        Self::require_admin(&env);
+        Self::require_pair_registered(&env, &source, &destination);
+        let already_disputed = Self::read_pair_disputed(&env, &source, &destination);
+        env.storage().persistent().set(
+            &DataKey::PairDisputed(source.clone(), destination.clone()),
+            &true,
+        );
+        if !already_disputed {
+            env.events()
+                .publish((symbol_short!("disp_set"),), (source, destination, true));
+        }
+    }
+
+    /// Admin clears a dispute flag, restoring normal routing and quoting
+    /// for the pair.
+    ///
+    /// Idempotent: resolving a pair with no active dispute is a clean
+    /// no-op that does not emit `disp_set`.
+    pub fn resolve_pair_dispute(env: Env, source: Symbol, destination: Symbol) {
+        Self::require_admin(&env);
+        let was_disputed = Self::read_pair_disputed(&env, &source, &destination);
+        env.storage().persistent().set(
+            &DataKey::PairDisputed(source.clone(), destination.clone()),
+            &false,
+        );
+        if was_disputed {
+            env.events()
+                .publish((symbol_short!("disp_set"),), (source, destination, false));
+        }
     }
 
     /// Configure an absolute upper bound on the fee charged for any route.
@@ -1097,6 +1146,14 @@ impl StableRouteRouter {
         Self::read_pair_registered(&env, &source, &destination)
     }
 
+    /// Returns `true` if `(source, destination)` currently has an active
+    /// dispute flag set via [`Self::flag_pair_dispute`].
+    ///
+    /// Does not mutate storage. Defaults to `false`.
+    pub fn is_pair_disputed(env: Env, source: Symbol, destination: Symbol) -> bool {
+        Self::read_pair_disputed(&env, &source, &destination)
+    }
+
     /// Returns the configured routing fee for the pair, expressed in basis
     /// points.
     ///
@@ -1125,6 +1182,9 @@ impl StableRouteRouter {
             panic_with_error!(&env, RouterError::AmountMustBePositive);
         }
         Self::require_pair_registered(&env, &source, &destination);
+        if Self::read_pair_disputed(&env, &source, &destination) {
+            panic_with_error!(&env, RouterError::PairDisputed);
+        }
         if matches!(
             env.storage()
                 .persistent()
@@ -1210,6 +1270,9 @@ impl StableRouteRouter {
 
         if !Self::read_pair_registered(&env, &source, &destination) {
             Self::route_abort(&env, RouterError::PairNotRegistered);
+        }
+        if Self::read_pair_disputed(&env, &source, &destination) {
+            Self::route_abort(&env, RouterError::PairDisputed);
         }
         let min_amount = Self::read_pair_min(&env, &source, &destination);
         if amount < min_amount {
@@ -1510,6 +1573,18 @@ impl StableRouteRouter {
             .unwrap_or(false)
     }
 
+    /// Read whether `(source, destination)` currently has an active
+    /// dispute flag. Single source of truth for the
+    /// [`DataKey::PairDisputed`] sentinel value; shared by `quote_route`
+    /// and `compute_route_fee` instead of each inlining its own storage
+    /// read.
+    fn read_pair_disputed(env: &Env, source: &Symbol, destination: &Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairDisputed(source.clone(), destination.clone()))
+            .unwrap_or(false)
+    }
+
     /// Read the per-pair fee in basis points from persistent storage.
     ///
     /// Returns `0` (free) when the slot is absent — the documented
@@ -1619,7 +1694,8 @@ impl StableRouteRouter {
         storage.remove(&DataKey::PairMinAmount(source.clone(), destination.clone()));
         storage.remove(&DataKey::PairMaxAmount(source.clone(), destination.clone()));
         storage.remove(&DataKey::PairLiquidity(source.clone(), destination.clone()));
-        storage.remove(&DataKey::PairCooldown(source, destination));
+        storage.remove(&DataKey::PairCooldown(source.clone(), destination.clone()));
+        storage.remove(&DataKey::PairDisputed(source, destination));
     }
 
     /// Remove a registered pair from the router.
@@ -2260,6 +2336,102 @@ mod test {
         let env = Env::default();
         let (client, _admin) = setup_initialized(&env);
         client.register_pair(&symbol_short!("USDC"), &symbol_short!("USDC"));
+    }
+
+    // --- dispute flag ---
+
+    #[test]
+    fn test_is_pair_disputed_defaults_to_false() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        assert!(!client.is_pair_disputed(&s, &d));
+    }
+
+    #[test]
+    fn test_flag_pair_dispute_blocks_quote_and_compute() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        assert!(client.is_pair_disputed(&s, &d));
+
+        let quote_result = client.try_quote_route(&s, &d, &1_000i128);
+        assert!(quote_result.is_err(), "disputed pair must reject quote_route");
+
+        let compute_result = client.try_compute_route_fee(&s, &d, &1_000i128);
+        assert!(
+            compute_result.is_err(),
+            "disputed pair must reject compute_route_fee"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pair_dispute_restores_routing() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        client.resolve_pair_dispute(&s, &d);
+        assert!(!client.is_pair_disputed(&s, &d));
+        // Routing works again once resolved.
+        client.quote_route(&s, &d, &1_000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_flag_pair_dispute_requires_registered_pair() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.flag_pair_dispute(&symbol_short!("USDC"), &symbol_short!("EURC"));
+    }
+
+    #[test]
+    fn test_flag_pair_dispute_does_not_duplicate_event_on_reflag() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        assert_eq!(
+            event_payloads(&env, symbol_short!("disp_set")).len(),
+            1,
+            "re-flagging an already-disputed pair must not emit a second disp_set event"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pair_dispute_on_undisputed_pair_is_noop_without_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.resolve_pair_dispute(&s, &d);
+        assert!(!client.is_pair_disputed(&s, &d));
+        assert_eq!(
+            event_payloads(&env, symbol_short!("disp_set")).len(),
+            0,
+            "resolving a pair with no active dispute must not emit disp_set"
+        );
+    }
+
+    #[test]
+    fn test_unregister_pair_clears_dispute_flag() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.flag_pair_dispute(&s, &d);
+        client.unregister_pair(&s, &d);
+        client.register_pair(&s, &d);
+        assert!(
+            !client.is_pair_disputed(&s, &d),
+            "re-registering after unregister must not inherit a stale dispute flag"
+        );
     }
 
     #[test]
