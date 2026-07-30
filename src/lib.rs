@@ -3991,6 +3991,55 @@ mod test {
         client.set_pair_min_amount(&symbol_short!("USDC"), &symbol_short!("EURC"), &-1i128);
     }
 
+    #[test]
+    fn test_set_pair_min_amount_allows_zero_boundary() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_min_amount(&s, &d, &0i128);
+        assert_eq!(client.get_pair_min_amount(&s, &d), 0);
+    }
+
+    #[test]
+    fn test_set_pair_fee_bps_allows_zero_boundary() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &0u32);
+        assert_eq!(client.get_pair_fee_bps(&s, &d), 0);
+    }
+
+    #[test]
+    fn test_set_pair_fee_bps_allows_at_exact_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_fee_bps(&s, &d, &MAX_FEE_BPS);
+        assert_eq!(client.get_pair_fee_bps(&s, &d), MAX_FEE_BPS);
+    }
+
+    #[test]
+    fn test_set_pair_cooldown_allows_at_exact_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &MAX_COOLDOWN_SECS);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_set_pair_cooldown_rejects_over_max() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        let (s, d) = (symbol_short!("USDC"), symbol_short!("EURC"));
+        client.register_pair(&s, &d);
+        client.set_pair_cooldown(&s, &d, &(MAX_COOLDOWN_SECS + 1));
+    }
+
     // --- compute_route_fee side-effect tests ---
 
     /// Register `(source, destination)` and set its fee so that
