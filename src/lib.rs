@@ -416,12 +416,22 @@ impl StableRouteRouter {
     }
 
     /// Cancel a pending handover, clearing both the pending admin and its
-    /// queued eta. No-op if none is pending.
+    /// queued eta. No-op (storage-wise) if none is pending.
+    ///
+    /// Emits a `cancelled` event carrying the pending admin and eta that
+    /// were cleared (both `None` on a no-op cancellation) — the third leg
+    /// of the propose (`queued`) / accept-or-force (`executed`) / cancel
+    /// (`cancelled`) event trail, so every claim-state transition is
+    /// observable on-chain, not just the two that previously had events.
     pub fn cancel_admin_transfer(env: Env) {
         Self::require_admin(&env);
+        let pending: Option<Address> = env.storage().instance().get(&DataKey::PendingAdmin);
+        let eta: Option<u64> = env.storage().persistent().get(&DataKey::PendingAdminEta);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage().persistent().remove(&DataKey::PendingAdminEta);
         Self::bump_instance_ttl(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"),), (pending, eta));
     }
 
     /// Step 2 of admin handover. The pending admin claims the role
@@ -2582,6 +2592,52 @@ mod test {
         client.cancel_admin_transfer();
         assert_eq!(client.get_pending_admin(), None);
         assert_eq!(client.get_pending_admin_eta(), None);
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin) = setup_initialized(&env);
+        client.set_timelock(&100);
+        let next_admin = Address::generate(&env);
+        client.propose_admin_transfer(&next_admin);
+        client.cancel_admin_transfer();
+
+        let payloads = event_payloads(&env, symbol_short!("cancelled"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "cancel_admin_transfer emits exactly one cancelled event"
+        );
+        let (pending, eta): (Option<Address>, Option<u64>) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("cancelled event data decodes to (Option<Address>, Option<u64>)");
+        assert_eq!(
+            pending,
+            Some(next_admin),
+            "must carry the cancelled pending admin"
+        );
+        assert_eq!(eta, Some(1_100), "must carry the cancelled eta");
+    }
+
+    /// A no-op cancellation (nothing pending) still emits `cancelled`, with
+    /// `(None, None)` as the payload, so indexers observe every
+    /// cancellation attempt — mirrors `clear_max_fee_absolute`'s
+    /// always-emit-on-no-op behaviour.
+    #[test]
+    fn test_cancel_admin_transfer_noop_emits_event_with_none() {
+        let env = Env::default();
+        let (client, _admin) = setup_initialized(&env);
+        client.cancel_admin_transfer();
+
+        let payloads = event_payloads(&env, symbol_short!("cancelled"));
+        assert_eq!(payloads.len(), 1);
+        let (pending, eta): (Option<Address>, Option<u64>) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("cancelled event data decodes to (Option<Address>, Option<u64>)");
+        assert_eq!(pending, None);
+        assert_eq!(eta, None);
     }
 
     // --- #21: governance timelock ---
