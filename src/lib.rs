@@ -630,9 +630,7 @@ impl StableRouteRouter {
     /// percentage-based calculation.
     pub fn set_max_fee_absolute(env: Env, max_fee: i128) {
         Self::require_admin(&env);
-        if max_fee < 0 {
-            panic_with_error!(&env, RouterError::AmountMustBePositive);
-        }
+        Self::require_non_negative_fee(&env, max_fee);
         if max_fee == 0 {
             panic_with_error!(&env, RouterError::ZeroFeeCap);
         }
@@ -665,9 +663,7 @@ impl StableRouteRouter {
     /// percentage-based fee would be lower.
     pub fn set_min_fee_absolute(env: Env, min_fee: i128) {
         Self::require_admin(&env);
-        if min_fee < 0 {
-            panic_with_error!(&env, RouterError::AmountMustBePositive);
-        }
+        Self::require_non_negative_fee(&env, min_fee);
         env.storage()
             .persistent()
             .set(&DataKey::MinFeeAbsolute, &min_fee);
@@ -1419,6 +1415,22 @@ impl StableRouteRouter {
     fn require_pair_registered(env: &Env, source: &Symbol, destination: &Symbol) {
         if !Self::read_pair_registered(env, source, destination) {
             panic_with_error!(env, RouterError::PairNotRegistered);
+        }
+    }
+
+    /// Require that a fee-bound value (the router's reward parameters —
+    /// [`Self::set_max_fee_absolute`] and [`Self::set_min_fee_absolute`]
+    /// both configure an absolute bound on the fee the router charges/earns
+    /// per route) is not negative; panics with
+    /// [`RouterError::AmountMustBePositive`] otherwise.
+    ///
+    /// Both setters previously repeated this exact `< 0` check inline. A
+    /// negative fee bound would be nonsensical (a route could never be
+    /// charged less than a negative amount), so this is enforced
+    /// identically at both call sites via one shared helper.
+    fn require_non_negative_fee(env: &Env, value: i128) {
+        if value < 0 {
+            panic_with_error!(env, RouterError::AmountMustBePositive);
         }
     }
 
