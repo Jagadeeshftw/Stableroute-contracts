@@ -429,24 +429,7 @@ impl StableRouteRouter {
     /// is pending or NotPendingAdmin if the caller does not match.
     pub fn accept_admin_transfer(env: Env, caller: Address) {
         caller.require_auth();
-        let pending: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NoPendingAdminTransfer));
-        if pending != caller {
-            panic_with_error!(&env, RouterError::NotPendingAdmin);
-        }
-        // Honour the governance timelock: the handover cannot execute until
-        // its stamped eta has been reached.
-        let eta: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingAdminEta)
-            .unwrap_or(0);
-        if env.ledger().timestamp() < eta {
-            panic_with_error!(&env, RouterError::TimelockNotElapsed);
-        }
+        Self::require_pending_admin_and_timelock_elapsed(&env, &caller);
         Self::finalize_admin_transfer(&env, caller);
     }
 
@@ -485,22 +468,7 @@ impl StableRouteRouter {
     /// so indexers can treat it identically.
     pub fn force_admin_transfer(env: Env, new_admin: Address) {
         Self::require_admin(&env);
-        let pending: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .unwrap_or_else(|| panic_with_error!(&env, RouterError::NoPendingAdminTransfer));
-        if pending != new_admin {
-            panic_with_error!(&env, RouterError::NotPendingAdmin);
-        }
-        let eta: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingAdminEta)
-            .unwrap_or(0);
-        if env.ledger().timestamp() < eta {
-            panic_with_error!(&env, RouterError::TimelockNotElapsed);
-        }
+        Self::require_pending_admin_and_timelock_elapsed(&env, &new_admin);
         Self::finalize_admin_transfer(&env, new_admin);
     }
 
@@ -1481,6 +1449,35 @@ impl StableRouteRouter {
     fn require_valid_fee_bps(env: &Env, fee_bps: u32) {
         if fee_bps > MAX_FEE_BPS {
             panic_with_error!(env, RouterError::FeeBpsTooHigh);
+        }
+    }
+
+    /// Require that `expected` is the currently pending admin and that the
+    /// governance timelock eta has elapsed; panics with
+    /// [`RouterError::NoPendingAdminTransfer`] if no handover is pending,
+    /// [`RouterError::NotPendingAdmin`] if `expected` does not match the
+    /// pending admin, or [`RouterError::TimelockNotElapsed`] if the eta has
+    /// not yet been reached. Shared precondition check of
+    /// [`Self::accept_admin_transfer`] (self-accept) and
+    /// [`Self::force_admin_transfer`] (admin-forced) — the two entrypoints
+    /// that complete a proposed handover — which previously repeated this
+    /// exact lookup/compare/timelock sequence inline.
+    fn require_pending_admin_and_timelock_elapsed(env: &Env, expected: &Address) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(env, RouterError::NoPendingAdminTransfer));
+        if &pending != expected {
+            panic_with_error!(env, RouterError::NotPendingAdmin);
+        }
+        let eta: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminEta)
+            .unwrap_or(0);
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(env, RouterError::TimelockNotElapsed);
         }
     }
 
