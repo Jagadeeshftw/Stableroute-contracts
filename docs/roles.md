@@ -58,7 +58,6 @@ Neither role should be used for the other's responsibilities.
 | set_oracle | ✅ | | |
 | remove_oracle | ✅ | | |
 | set_pair_liquidity | ✅ (authorization) | ✅ (authorization) | |
-| top_up_pair_liquidity | ✅ (authorization) | ✅ (authorization) | |
 | get_pair_max_amount | | | ✅ |
 | set_pair_max_amount | ✅ | | |
 | get_pair_min_amount | | | ✅ |
@@ -102,7 +101,7 @@ The admin **does not directly publish liquidity values**.
 
 The oracle has one operational responsibility:
 
-- Publish or increment liquidity values for registered pairs.
+- Publish liquidity values for registered pairs.
 
 Liquidity updates require authorization from both:
 
@@ -179,4 +178,4 @@ The contract intentionally separates governance from operational data updates.
 
 Neither role should routinely perform the other's duties.
 
-The dual-auth requirement on `set_pair_liquidity` and `top_up_pair_liquidity` provides an additional safeguard by requiring participation from both trusted parties.
+The dual-auth requirement on `set_pair_liquidity` provides an additional safeguard by requiring participation from both trusted parties.

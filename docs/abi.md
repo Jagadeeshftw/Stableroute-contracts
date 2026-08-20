@@ -72,7 +72,6 @@ _pending_ = the proposed pending admin must sign · _none_ = no auth.
 | `set_pair_max_amount` | admin | `source, destination: Symbol, max_amount: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `max_set(source, destination, max_amount)` |
 | `get_pair_max_amount` | none | `source, destination: Symbol` | `i128` | — | — |
 | `set_pair_liquidity` | admin | `source, destination: Symbol, liquidity: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `liq_set(source, destination, liquidity)` |
-| `top_up_pair_liquidity` | oracle/admin | `source, destination: Symbol, delta: i128` | — | `NotInitialized` (#2), `AmountMustBePositive` (#6) | `liq_set(source, destination, liquidity)` |
 | `get_pair_liquidity` | none | `source, destination: Symbol` | `i128` | — | — |
 
 ## Routing
@@ -103,7 +102,7 @@ payload tuple. Topic symbols are capped at 9 characters.
 | `min_set` | `(source, destination, min_amount): (Symbol, Symbol, i128)` | `set_pair_min_amount` |
 | `max_set` | `(source, destination, max_amount): (Symbol, Symbol, i128)` | `set_pair_max_amount` |
 | `recip_set` | `recipient: Address` | `set_fee_recipient` |
-| `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity`, `top_up_pair_liquidity` |
+| `liq_set` | `(source, destination, liquidity): (Symbol, Symbol, i128)` | `set_pair_liquidity` |
 | `route` | `(source, destination, amount): (Symbol, Symbol, i128)` | `compute_route_fee` |
 | `metr_rm` | `(source, destination, route_count, volume): (Symbol, Symbol, u64, i128)` | `purge_pair_metrics` |
 | `pair_mrst` | `(source, destination): (Symbol, Symbol)` | `purge_pair_metrics` |
